@@ -149,15 +149,17 @@ struct Persons {
             }
         }
     }
-    Key name(Key user) const {
-        u64 h = key_hash(user);
+    Key name(Key user) const { return name_hashed(user, key_hash(user)); }
+    // h must be key_hash(user)
+    Key name_hashed(Key user, u64 h) const {
         for (size_t i = slot(h);; i = next(i)) {
             const auto& s = slots[i];
             if (s.k == user) return s.v;
             if (!s.k) return user;
         }
     }
-    void prefetch_user(Key user) const { prefetch(&slots[slot(key_hash(user))]); }
+    void prefetch_user(Key user) const { prefetch_hashed(key_hash(user)); }
+    void prefetch_hashed(u64 h) const { prefetch(&slots[slot(h)]); }
     size_t size() const { return count; }
 };
 
@@ -518,18 +520,19 @@ struct Pipeline {
                 struct Pending {
                     Key user;
                     E ev;
+                    u64 h;  // key_hash(user)
                 };
                 Pending ring[kPrefetch];
                 size_t count = 0;
                 auto emit = [&](const Pending& x) {
-                    Key person = persons.name(x.user);
+                    Key person = persons.name_hashed(x.user, x.h);
                     st.ev.push(size_t(key_hash(person) >> person_shift), PersonEvent<E>{person, x.ev});
                 };
                 for (size_t wi = 0; wi < st.wins.size(); ++wi) {
                     for (u64 bits = st.wins[wi]; bits; bits &= bits - 1) {
                         const EventRec<E>& r = rec((u64(wi) << 6) | u64(__builtin_ctzll(bits)));
-                        Pending x{r.user, r.ev};
-                        persons.prefetch_user(x.user);
+                        Pending x{r.user, r.ev, key_hash(r.user)};
+                        persons.prefetch_hashed(x.h);
                         if (count >= kPrefetch) emit(ring[count % kPrefetch]);
                         ring[count % kPrefetch] = x;
                         ++count;
@@ -591,7 +594,7 @@ struct Pipeline {
             size_t n = 0;
             for (auto& d : dedup) n += d.ev.size(p);
             if (!n) return;
-            st.local.reset(n / 16 + 16);
+            st.local.reset(n / 48 + 16);
             st.names.clear();
             st.offsets.assign(1, 0);
             st.raw.resize(n);
