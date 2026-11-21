@@ -10,6 +10,7 @@
 #include "sessions.hpp"
 #include "table.hpp"
 #include <map>
+#include <type_traits>
 #include <sys/resource.h>
 
 namespace ss {
@@ -26,9 +27,13 @@ struct EventRec {  // one parsed event line: the event packed as kept, or all on
     i64 ingest;
     E ev;
 };
+// Click times relative to the click window start: 32 bits when events pack in u64.
+template <class E>
+using Rel = std::conditional_t<std::is_same_v<E, u64>, u32, u64>;
+template <class E>
 struct ClickRec {
     Key cid, user;
-    i64 ts;
+    Rel<E> rel;
     u32 camp;
 };
 template <class E>
@@ -36,12 +41,15 @@ struct PersonEvent {
     Key person;
     E ev;
 };
+template <class E>
 struct PersonClick {
     Key person, cid;
-    i64 ts;
+    Rel<E> rel;
     u32 camp;
 };
 #pragma pack(pop)
+static_assert(sizeof(EventRec<u64>) == 48 && sizeof(ClickRec<u64>) == 40 && sizeof(PersonClick<u64>) == 40 &&
+              sizeof(PersonEvent<u64>) == 24);
 
 // ---------------------------------------------------------------- catalog
 
@@ -197,7 +205,7 @@ struct Pipeline {
     template <class E>
     struct ParseState {
         Scatter<EventRec<E>> ev;
-        Scatter<ClickRec> ck{1};
+        Scatter<ClickRec<E>> ck{1};
         explicit ParseState(size_t buckets) : ev(buckets) {}
     };
     size_t event_buckets = 0;
@@ -258,13 +266,14 @@ struct Pipeline {
         out.push(size_t(key_hash(r.eid) >> event_shift), r);
     }
 
-    void parse_click(Field (&f)[4], Scatter<ClickRec>& out) {
+    template <class E>
+    void parse_click(Field (&f)[4], Scatter<ClickRec<E>>& out) {
         if (f[0].empty() || f[1].empty() || f[2].empty()) return;
         const u32* camp = catalog->campaigns.find(make_key(f[2]));
         if (!camp) return;
         i64 ts;
         if (!parse_ts(f[3], ts) || ts < w.click_start || ts >= w.end) return;
-        out.push(0, ClickRec{make_key(f[0]), make_key(f[1]), ts, *camp});
+        out.push(0, ClickRec<E>{make_key(f[0]), make_key(f[1]), Rel<E>(ts - w.click_start), *camp});
     }
 
     void run() {
@@ -326,7 +335,7 @@ struct Pipeline {
             if (i < event_chunks)
                 for_lines<7>(*c.in, c.s, c.e, [&](Field (&f)[7]) { parse_event<E>(f, st.ev); });
             else
-                for_lines<4>(*c.in, c.s, c.e, [&](Field (&f)[4]) { parse_click(f, st.ck); });
+                for_lines<4>(*c.in, c.s, c.e, [&](Field (&f)[4]) { parse_click<E>(f, st.ck); });
         });
         persons_thread.join();
         timer.lap("parse");
@@ -356,7 +365,7 @@ struct Pipeline {
 
         struct DedupState {
             Scatter<PersonEvent<E>> ev;
-            Scatter<PersonClick> ck;
+            Scatter<PersonClick<E>> ck;
             std::vector<u64> table, wins;
             std::vector<const EventRec<E>*> blocks;
             explicit DedupState(size_t n) : ev(n), ck(n) {}
@@ -448,9 +457,9 @@ struct Pipeline {
                     for (u32 i = 0; i < len && i < kPrefetch; ++i) persons.map.prefetch_key(blk[i].user);
                     for (u32 i = 0; i < len; ++i) {
                         if (i + kPrefetch < len) persons.map.prefetch_key(blk[i + kPrefetch].user);
-                        const ClickRec& c = blk[i];
+                        const ClickRec<E>& c = blk[i];
                         Key person = persons.name(c.user);
-                        st.ck.push(size_t(key_hash(person) >> person_shift), PersonClick{person, c.cid, c.ts, c.camp});
+                        st.ck.push(size_t(key_hash(person) >> person_shift), PersonClick<E>{person, c.cid, c.rel, c.camp});
                     }
                 }
             }
@@ -486,7 +495,6 @@ struct Pipeline {
             // about one user-day row per 8 kept events: reserve (untouched) room for 2x that
             sess.back().work.rows.reserve(kept / threads / 4 + 1024);
         }
-        const i64 cws = w.click_start;
         run_tasks(sess, person_buckets, [&](SessionState& st, size_t task) {
             size_t p = order[task].second;
             size_t n = 0;
@@ -527,10 +535,10 @@ struct Pipeline {
             st.raw_camps.clear();
             max_hi = 0;
             for (auto& d : dedup) {
-                d.ck.for_each(p, [&](const PersonClick& c) {
+                d.ck.for_each(p, [&](const PersonClick<E>& c) {
                     const u32* lid = st.local.find(c.person);
                     if (!lid) return;
-                    u64 rel = u64(c.ts - cws);
+                    u64 rel = c.rel;
                     st.ck_raw.push_back(P::pair(rel, st.ck_raw.size()));
                     st.ck_lids.push_back(*lid);
                     st.raw_cids.push_back(c.cid);
