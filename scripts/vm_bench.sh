@@ -18,6 +18,6 @@ while [ $i -lt $RUNS ]; do
     rm -rf /tmp/o; mkdir -p /tmp/o
     s=$(date +%s%N); SHOPPING_PROFILE=1 /bin$n $D /tmp/o 2>/tmp/log; e=$(date +%s%N)
     printf "bin%s wall=%5sms  " $n $(( (e-s)/1000000 ))
-    awk "/ms\\]/{printf \"%s=%s \", \$4, \$5}" /tmp/log; echo
+    awk "/ms\\]/{printf \"%s=%s \", \$4, \$5} /faults=/{printf \"%s %s\", \$3, \$4}" /tmp/log; echo
   done
 done'

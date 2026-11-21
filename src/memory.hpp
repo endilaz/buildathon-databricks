@@ -66,6 +66,18 @@ inline std::vector<std::string> csv_files(const std::filesystem::path& dir) {
     return out;
 }
 
+// Asks for transparent huge pages on the 2 MB-aligned interior of a big
+// untouched allocation (the scorer's THP mode may be "madvise").
+inline void advise_huge(void* p, size_t n) {
+#ifdef __linux__
+    constexpr uintptr_t huge = uintptr_t(2) << 20;
+    uintptr_t a = (uintptr_t(p) + huge - 1) & ~(huge - 1), b = (uintptr_t(p) + n) & ~(huge - 1);
+    if (b > a) madvise(reinterpret_cast<void*>(a), b - a, MADV_HUGEPAGE);
+#else
+    (void)p, (void)n;
+#endif
+}
+
 // ---------------------------------------------------------------- arena
 
 inline void* map_anon(size_t bytes) {

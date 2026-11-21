@@ -10,20 +10,21 @@
 #include "sessions.hpp"
 #include "table.hpp"
 #include <map>
+#include <sys/resource.h>
 
 namespace ss {
 namespace {
 
-constexpr u32 kInvalid = UINT32_MAX;
 constexpr int kPrefetch = 32;               // person lookups issued this many records ahead
 constexpr size_t kEventBucketLines = 32768;  // event_id buckets: about this many lines each
 constexpr size_t kPersonBucketEvents = 16384;  // person buckets: about this many events each
 
 #pragma pack(push, 8)
-struct EventRec {  // one parsed event line; cat == kInvalid when it fails validation
+template <class E>
+struct EventRec {  // one parsed event line: the event packed as kept, or all ones when invalid
     Key eid, user;
-    i64 ingest, ts;
-    u32 price, cat;
+    i64 ingest;
+    E ev;
 };
 struct ClickRec {
     Key cid, user;
@@ -193,12 +194,12 @@ struct Pipeline {
     Catalog* catalog = nullptr;
     std::vector<Input> link_files, event_files, click_files;
 
+    template <class E>
     struct ParseState {
-        Scatter<EventRec> ev;
+        Scatter<EventRec<E>> ev;
         Scatter<ClickRec> ck{1};
         explicit ParseState(size_t buckets) : ev(buckets) {}
     };
-    std::vector<ParseState> parsed;
     size_t event_buckets = 0;
     u32 event_shift = 0;
     Persons persons;
@@ -227,11 +228,12 @@ struct Pipeline {
         unmap_input(m);
     }
 
-    void parse_event(Field (&f)[7], Scatter<EventRec>& out) {
+    template <class E>
+    void parse_event(Field (&f)[7], Scatter<EventRec<E>>& out) {
         if (f[0].empty()) return;
         i64 ingest;
         if (!parse_f1(f[3], ingest)) return;
-        EventRec r{make_key(f[0]), 0, ingest, 0, 0, kInvalid};
+        EventRec<E> r{make_key(f[0]), 0, ingest, ~E(0)};
         i64 ts;
         if (!f[1].empty() && !f[5].empty() && parse_ts(f[2], ts) && ts >= w.start && ts < w.end &&
             ingest - ts <= kDay) {
@@ -247,10 +249,10 @@ struct Pipeline {
                 ok = t == load32("view") || t == load32("cart");
             }
             if (ok) {
+                // only purchases need a category: top_category sums purchase prices
+                u32 cat = price ? catalog->category(f[5]) : 0;
                 r.user = make_key(f[1]);
-                r.ts = ts;
-                r.price = price;
-                r.cat = catalog->category(f[5]);
+                r.ev = Pack<E>::event(u64(ts - w.start), cat, price);
             }
         }
         out.push(size_t(key_hash(r.eid) >> event_shift), r);
@@ -295,22 +297,34 @@ struct Pipeline {
         catalog_thread.join();
         timer.lap("links");
 
+        // events are packed in 64 bits when the window, prices and categories fit
+        bool small = catalog->categories.size() <= 256 && w.end - w.click_start < (i64(1) << 32) &&
+                     !std::getenv("SHOPPING_WIDE");  // forces the general path, for tests
+        if (small)
+            process<u64>(link_pairs, ev_bytes);
+        else
+            process<u128>(link_pairs, ev_bytes);
+    }
+
+    template <class E>
+    void process(std::vector<std::vector<std::pair<Key, Key>>>& link_pairs, size_t ev_bytes) {
+        std::vector<Chunk> chunks;
         // parse events and clicks while the persons are built
         size_t est_lines = ev_bytes / 72 + 1;
         event_buckets = std::clamp<size_t>(pow2_at_least(est_lines / kEventBucketLines), 16, 4096);
         event_shift = 64 - log2_exact(event_buckets);
-        chunks.clear();
         plan_chunks(event_files, size_t(4) << 20, chunks);
         size_t event_chunks = chunks.size();
         plan_chunks(click_files, size_t(4) << 20, chunks);
         std::thread persons_thread([&] { persons = build_persons(link_pairs); });
+        std::vector<ParseState<E>> parsed;
         parsed.reserve(threads);
         for (size_t t = 0; t < threads; ++t) parsed.emplace_back(event_buckets);
-        run_tasks(parsed, chunks.size(), [&](ParseState& st, size_t i) {
+        run_tasks(parsed, chunks.size(), [&](ParseState<E>& st, size_t i) {
             auto& c = chunks[i];
             populate(*c.in, c.s, c.e + 4096);
             if (i < event_chunks)
-                for_lines<7>(*c.in, c.s, c.e, [&](Field (&f)[7]) { parse_event(f, st.ev); });
+                for_lines<7>(*c.in, c.s, c.e, [&](Field (&f)[7]) { parse_event<E>(f, st.ev); });
             else
                 for_lines<4>(*c.in, c.s, c.e, [&](Field (&f)[4]) { parse_click(f, st.ck); });
         });
@@ -323,15 +337,11 @@ struct Pipeline {
                 for (auto& f : *v) unmap_input(f);
         }).detach();
 
-        bool small = catalog->categories.size() <= 256 && w.end - w.click_start < (i64(1) << 32);
-        if (small)
-            finish<u64>();
-        else
-            finish<u128>();
+        finish<E>(parsed);
     }
 
     template <class E>
-    void finish() {
+    void finish(std::vector<ParseState<E>>& parsed) {
         using P = Pack<E>;
         // ---- dedup events, map events and clicks to persons, scatter by person
         size_t total_events = 0;
@@ -348,13 +358,12 @@ struct Pipeline {
             Scatter<PersonEvent<E>> ev;
             Scatter<PersonClick> ck;
             std::vector<u64> table, wins;
-            std::vector<const EventRec*> blocks;
+            std::vector<const EventRec<E>*> blocks;
             explicit DedupState(size_t n) : ev(n), ck(n) {}
         };
         std::vector<DedupState> dedup;
         dedup.reserve(threads);
         for (size_t t = 0; t < threads; ++t) dedup.emplace_back(person_buckets);
-        const i64 ws = w.start;
         run_tasks(dedup, event_buckets + click_tasks.size(), [&](DedupState& st, size_t task) {
             if (task < event_buckets) {
                 size_t b = task;
@@ -372,17 +381,17 @@ struct Pipeline {
                     for (size_t j = 0; j < p.ev.num_blocks(b); ++j) lens.push_back(p.ev.block(b, j).second);
                 size_t cap = pow2_at_least(2 * n), mask = cap - 1;
                 st.table.assign(cap, 0);
-                st.wins.assign((st.blocks.size() * Scatter<EventRec>::kBlock + 63) / 64, 0);
-                auto rec = [&](u64 ref) -> const EventRec& { return st.blocks[ref >> 7][ref & 127]; };
+                st.wins.assign((st.blocks.size() * Scatter<EventRec<E>>::kBlock + 63) / 64, 0);
+                auto rec = [&](u64 ref) -> const EventRec<E>& { return st.blocks[ref >> 7][ref & 127]; };
                 for (size_t bi = 0; bi < st.blocks.size(); ++bi) {
-                    const EventRec* blk = st.blocks[bi];
+                    const EventRec<E>* blk = st.blocks[bi];
                     for (u32 i = 0; i < lens[bi]; ++i) {
-                        const EventRec& r = blk[i];
+                        const EventRec<E>& r = blk[i];
                         u64 ref = (u64(bi) << 7) | i;
                         u64 h = key_hash(r.eid);
                         u64 tag = h >> 32;
                         u64 entry = (tag << 32) | (ref + 1);
-                        u64 valid = r.cat != kInvalid;
+                        u64 valid = r.ev != ~E(0);
                         for (size_t s = h & mask;; s = (s + 1) & mask) {
                             u64 cur = st.table[s];
                             if (!cur) {
@@ -392,7 +401,7 @@ struct Pipeline {
                             }
                             if ((cur >> 32) == tag) {
                                 u64 old = (cur & 0xFFFFFFFFu) - 1;
-                                const EventRec& o = rec(old);
+                                const EventRec<E>& o = rec(old);
                                 if (o.eid == r.eid) {
                                     if (r.ingest < o.ingest) {
                                         st.table[s] = entry;
@@ -418,8 +427,8 @@ struct Pipeline {
                 };
                 for (size_t wi = 0; wi < st.wins.size(); ++wi) {
                     for (u64 bits = st.wins[wi]; bits; bits &= bits - 1) {
-                        const EventRec& r = rec((u64(wi) << 6) | u64(__builtin_ctzll(bits)));
-                        Pending x{r.user, P::event(u64(r.ts - ws), r.cat, r.price)};
+                        const EventRec<E>& r = rec((u64(wi) << 6) | u64(__builtin_ctzll(bits)));
+                        Pending x{r.user, r.ev};
                         persons.map.prefetch_key(x.user);
                         if (count >= kPrefetch) emit(ring[count % kPrefetch]);
                         ring[count % kPrefetch] = x;
@@ -570,6 +579,11 @@ struct Pipeline {
             write_users(rows, ud_dir + name);
         });
         timer.lap("output");
+        if (timer.on) {
+            struct rusage u{};
+            getrusage(RUSAGE_SELF, &u);
+            std::fprintf(stderr, "[%8s] faults=%ld maxrss=%ldMB\n", "", u.ru_minflt, u.ru_maxrss / 1024);
+        }
     }
 
     void write_users(const std::vector<UserRow>& rows, const std::string& path) {
@@ -643,6 +657,20 @@ struct Pipeline {
 
 }  // namespace
 }  // namespace ss
+
+// Big containers (the persons map, dedup tables, session arrays, output
+// buffers) get huge pages like the arena does.
+void* operator new(size_t n) {
+    void* p = std::malloc(n ? n : 1);
+    if (!p) ss::die("out of memory (%zu bytes)", n);
+    if (n >= (size_t(2) << 20)) ss::advise_huge(p, n);
+    return p;
+}
+void* operator new[](size_t n) { return operator new(n); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
+void operator delete[](void* p, size_t) noexcept { std::free(p); }
 
 int main(int argc, char** argv) {
     const char* data = std::getenv("DATA_DIR");

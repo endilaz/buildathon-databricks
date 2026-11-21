@@ -47,9 +47,12 @@ public:
     size_t size() const { return size_; }
     size_t slot(Key k) const { return size_t(key_hash(k)) & mask_; }
     void prefetch_key(Key k) const { prefetch(&slots_[slot(k)]); }
+    void prefetch_hash(u64 h) const { prefetch(&slots_[size_t(h) & mask_]); }
 
-    const V* find(Key k) const {
-        for (size_t i = slot(k);; i = (i + 1) & mask_) {
+    const V* find(Key k) const { return find_hashed(k, key_hash(k)); }
+    // h must be key_hash(k)
+    const V* find_hashed(Key k, u64 h) const {
+        for (size_t i = size_t(h) & mask_;; i = (i + 1) & mask_) {
             const auto& s = slots_[i];
             if (s.k == k) return &s.v;
             if (!s.k) return nullptr;
