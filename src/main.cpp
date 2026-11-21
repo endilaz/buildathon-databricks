@@ -123,29 +123,107 @@ struct Catalog {
 // ---------------------------------------------------------------- links
 
 struct Persons {
-    KeyMap<Key> map;  // every ID in a kept link line -> its person's name
-    Key name(Key user) const {
-        const Key* v = map.find(user);
-        return v ? *v : user;
+    // every ID in a kept link line -> its person's name: one flat
+    // linear-probing table (one huge-page allocation), split by the top bits
+    // of the key hash into equal regions that are filled in parallel
+    static constexpr u32 kPartBits = 6;
+    static size_t part(u64 h) { return size_t(h >> (64 - kPartBits)); }
+    std::vector<KeySlot<Key>> slots = std::vector<KeySlot<Key>>(size_t(1) << kPartBits);
+    size_t region_bits = 0;  // each region holds 2^region_bits slots
+    size_t count = 0;
+
+    size_t slot(u64 h) const { return (part(h) << region_bits) | (size_t(h) & ((size_t(1) << region_bits) - 1)); }
+    size_t next(size_t i) const {
+        size_t mask = (size_t(1) << region_bits) - 1;
+        return (i & ~mask) | ((i + 1) & mask);
     }
+    // Inserts k (absent: value v) into its region; returns its value.
+    Key& insert(Key k, u64 h, Key v) {
+        for (size_t i = slot(h);; i = next(i)) {
+            auto& s = slots[i];
+            if (s.k == k) return s.v;
+            if (!s.k) {
+                s.k = k;
+                s.v = v;
+                return s.v;
+            }
+        }
+    }
+    Key name(Key user) const {
+        u64 h = key_hash(user);
+        for (size_t i = slot(h);; i = next(i)) {
+            const auto& s = slots[i];
+            if (s.k == user) return s.v;
+            if (!s.k) return user;
+        }
+    }
+    void prefetch_user(Key user) const { prefetch(&slots[slot(key_hash(user))]); }
+    size_t size() const { return count; }
 };
 
-inline Persons build_persons(std::vector<std::vector<std::pair<Key, Key>>>& pairs) {
-    size_t n = 0;
-    for (auto& v : pairs) n += v.size();
+#pragma pack(push, 8)
+struct Endpoint {
+    Key k;
+    u32 ref;  // 2 * pair index + side
+};
+#pragma pack(pop)
+
+// Union-find over the link pairs with every step but the unions parallel:
+// endpoints are split by key-hash part, each part gives its IDs dense
+// indexes in its own region of the final table, the unions run over those
+// small integers, and each region then maps its IDs to their person's name.
+inline Persons build_persons(std::vector<std::vector<std::pair<Key, Key>>>& pairs, size_t threads) {
+    constexpr size_t P = size_t(1) << Persons::kPartBits;
+    const size_t nv = pairs.size();
+    std::vector<size_t> base(nv + 1, 0);
+    for (size_t t = 0; t < nv; ++t) base[t + 1] = base[t] + pairs[t].size();
+    const size_t n = base[nv];
     Persons out;
-    out.map.reset(n + n / 2 + 16);
-    std::vector<Key> keys;
-    std::vector<u32> parent;
-    keys.reserve(n);
-    parent.reserve(n);
-    auto id = [&](Key k) {
-        return u32(out.map.get_or_insert(k, [&] {
-            keys.push_back(k);
-            parent.push_back(u32(keys.size() - 1));
-            return Key(keys.size() - 1);
-        }));
-    };
+    if (!n) return out;
+    std::vector<int> workers(threads);
+
+    std::vector<Scatter<Endpoint>> spread;
+    spread.reserve(nv);
+    for (size_t t = 0; t < nv; ++t) spread.emplace_back(P);
+    run_tasks(workers, nv, [&](int&, size_t t) {
+        auto& v = pairs[t];
+        for (size_t j = 0; j < v.size(); ++j) {
+            u32 ref = u32((base[t] + j) * 2);
+            spread[t].push(Persons::part(key_hash(v[j].first)), Endpoint{v[j].first, ref});
+            spread[t].push(Persons::part(key_hash(v[j].second)), Endpoint{v[j].second, ref + 1});
+        }
+    });
+
+    // dense index per part; an endpoint's id is (index << kPartBits) | part
+    size_t most = 0;
+    for (size_t p = 0; p < P; ++p) {
+        size_t cnt = 0;
+        for (auto& sc : spread) cnt += sc.size(p);
+        most = std::max(most, cnt);
+    }
+    // regions sized for every endpoint being distinct, at most 2/3 full
+    while ((size_t(1) << out.region_bits) * 2 < most * 3) ++out.region_bits;
+    out.slots.assign(P << out.region_bits, KeySlot<Key>{});
+    std::vector<u32> endpoint(2 * n), sizes(P);
+    run_tasks(workers, P, [&](int&, size_t p) {
+        u32 next = 0;
+        for (auto& sc : spread)
+            sc.for_each(p, [&](const Endpoint& e) {
+                Key& v = out.insert(e.k, key_hash(e.k), Key(next));
+                if (u32(v) == next) ++next;
+                endpoint[e.ref] = (u32(v) << Persons::kPartBits) | u32(p);
+            });
+        sizes[p] = next;
+    });
+    std::vector<u32> offset(P + 1, 0);
+    for (size_t p = 0; p < P; ++p) offset[p + 1] = offset[p] + sizes[p];
+    const u32 ids = offset[P];
+    out.count = ids;
+    auto global = [&](u32 e) { return offset[e & (P - 1)] + (e >> Persons::kPartBits); };
+
+    // unions; a non-root's parent always has a smaller index
+    std::vector<u32> parent(ids);
+    for (u32 i = 0; i < ids; ++i) parent[i] = i;
     auto find = [&](u32 x) {
         while (parent[x] != x) {
             parent[x] = parent[parent[x]];
@@ -153,19 +231,27 @@ inline Persons build_persons(std::vector<std::vector<std::pair<Key, Key>>>& pair
         }
         return x;
     };
-    for (auto& v : pairs) {
-        for (auto& [a, b] : v) {
-            u32 ra = find(id(a)), rb = find(id(b));
-            if (ra != rb) parent[std::max(ra, rb)] = std::min(ra, rb);
-        }
-        std::vector<std::pair<Key, Key>>().swap(v);
+    for (size_t j = 0; j < n; ++j) {
+        u32 ra = find(global(endpoint[2 * j])), rb = find(global(endpoint[2 * j + 1]));
+        if (ra != rb) parent[std::max(ra, rb)] = std::min(ra, rb);
     }
-    std::vector<Key> best(keys);
-    for (u32 i = 0; i < keys.size(); ++i) {
-        u32 r = find(i);
-        if (key_less(keys[i], best[r])) best[r] = keys[i];
+    // in index order every parent is already final, so one pass compresses
+    // all paths and finds each root's smallest name
+    const size_t region = size_t(1) << out.region_bits;
+    std::vector<Key> name(ids);
+    run_tasks(workers, P, [&](int&, size_t p) {
+        for (size_t i = p * region; i < (p + 1) * region; ++i)
+            if (auto& s = out.slots[i]; s.k) name[offset[p] + u32(s.v)] = s.k;
+    });
+    for (u32 i = 0; i < ids; ++i) {
+        u32 r = parent[i] = parent[parent[i]];
+        if (r != i && key_less(name[i], name[r])) name[r] = name[i];
     }
-    out.map.for_each([&](Key, Key& v) { v = best[find(u32(v))]; });
+    run_tasks(workers, P, [&](int&, size_t p) {
+        for (size_t i = p * region; i < (p + 1) * region; ++i)
+            if (auto& s = out.slots[i]; s.k) s.v = name[parent[offset[p] + u32(s.v)]];
+    });
+    for (auto& v : pairs) std::vector<std::pair<Key, Key>>().swap(v);
     return out;
 }
 
@@ -318,14 +404,20 @@ struct Pipeline {
     template <class E>
     void process(std::vector<std::vector<std::pair<Key, Key>>>& link_pairs, size_t ev_bytes) {
         std::vector<Chunk> chunks;
-        // parse events and clicks while the persons are built
         size_t est_lines = ev_bytes / 72 + 1;
         event_buckets = std::clamp<size_t>(pow2_at_least(est_lines / kEventBucketLines), 16, 4096);
         event_shift = 64 - log2_exact(event_buckets);
         plan_chunks(event_files, size_t(4) << 20, chunks);
         size_t event_chunks = chunks.size();
         plan_chunks(click_files, size_t(4) << 20, chunks);
-        std::thread persons_thread([&] { persons = build_persons(link_pairs); });
+        {
+            auto t0 = std::chrono::steady_clock::now();
+            persons = build_persons(link_pairs, threads);
+            if (timer.on)
+                std::fprintf(stderr, "[%8s] persons built in %.1f ms (%zu ids)\n", "",
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                             persons.size());
+        }
         std::vector<ParseState<E>> parsed;
         parsed.reserve(threads);
         for (size_t t = 0; t < threads; ++t) parsed.emplace_back(event_buckets);
@@ -337,7 +429,6 @@ struct Pipeline {
             else
                 for_lines<4>(*c.in, c.s, c.e, [&](Field (&f)[4]) { parse_click<E>(f, st.ck); });
         });
-        persons_thread.join();
         timer.lap("parse");
         // the records hold keys, not pointers: release the inputs off the critical path
         std::thread([files = std::move(event_files), clicks = std::move(click_files),
@@ -438,7 +529,7 @@ struct Pipeline {
                     for (u64 bits = st.wins[wi]; bits; bits &= bits - 1) {
                         const EventRec<E>& r = rec((u64(wi) << 6) | u64(__builtin_ctzll(bits)));
                         Pending x{r.user, r.ev};
-                        persons.map.prefetch_key(x.user);
+                        persons.prefetch_user(x.user);
                         if (count >= kPrefetch) emit(ring[count % kPrefetch]);
                         ring[count % kPrefetch] = x;
                         ++count;
@@ -454,9 +545,9 @@ struct Pipeline {
                 size_t last = std::min(src.num_blocks(0), first + kClickTaskBlocks);
                 for (size_t j = first; j < last; ++j) {
                     auto [blk, len] = src.block(0, j);
-                    for (u32 i = 0; i < len && i < kPrefetch; ++i) persons.map.prefetch_key(blk[i].user);
+                    for (u32 i = 0; i < len && i < kPrefetch; ++i) persons.prefetch_user(blk[i].user);
                     for (u32 i = 0; i < len; ++i) {
-                        if (i + kPrefetch < len) persons.map.prefetch_key(blk[i + kPrefetch].user);
+                        if (i + kPrefetch < len) persons.prefetch_user(blk[i + kPrefetch].user);
                         const ClickRec<E>& c = blk[i];
                         Key person = persons.name(c.user);
                         st.ck.push(size_t(key_hash(person) >> person_shift), PersonClick<E>{person, c.cid, c.rel, c.camp});
