@@ -1,0 +1,43 @@
+# x86 benchmark of this branch against the competitor's public repo on a
+# GitHub-hosted runner. Results are pushed to the bench-results branch.
+name: x86 bench
+on:
+  push:
+    branches: [bench-ci]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build this branch's image
+        run: |
+          docker build -q -t ours .
+          cid=$(docker create ours) && docker cp $cid:/shopping-sessions ./ours && docker rm $cid
+      - name: Build an unstripped copy for profiling
+        run: |
+          make CXX=g++ ARCHFLAGS="-march=x86-64-v3 -mtune=cascadelake" \
+            CXXFLAGS="-O3 -DNDEBUG -flto=auto -fno-plt -g -fno-omit-frame-pointer" LDFLAGS=-static BIN=ours-g
+      - name: Build the reference image
+        run: |
+          git clone -q --depth 1 https://github.com/hansliu-dev/676767 ref
+          (cd ref && git log --oneline -1 && docker build -q -t refimg .)
+          cid=$(docker create refimg) && docker cp $cid:/shopping-sessions ./refbin && docker rm $cid
+      - name: Generate 20M events
+        run: |
+          cd ref/pgo/generator && cargo build --release -q
+          ./target/release/generate --seed 21 --events 20000000 --clicks 5000000 --output $HOME/data
+          du -sh $HOME/data
+      - name: Benchmark
+        run: bash scripts/ci_bench.sh $HOME/data results.txt
+      - name: Publish results
+        if: always()
+        run: |
+          mkdir pub && cp results.txt pub/ 2>/dev/null; cp perf-*.txt pub/ 2>/dev/null; true
+          cd pub && git init -q && git checkout -q -b bench-results
+          git config user.name github-actions && git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A && git commit -qm "x86 bench results for $GITHUB_SHA"
+          git push -qf "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" bench-results
