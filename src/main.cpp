@@ -386,6 +386,9 @@ struct Pipeline {
         std::vector<Chunk> chunks;
         plan_chunks(link_files, size_t(1) << 20, chunks);
         std::vector<std::vector<std::pair<Key, Key>>> link_pairs(threads);
+        size_t link_bytes = 0;
+        for (auto& f : link_files) link_bytes += f.len;
+        for (auto& v : link_pairs) v.reserve(link_bytes / 18 / threads + 1024);  // lines are ~20 bytes
         run_tasks(link_pairs, chunks.size(), [&](auto& out, size_t i) {
             auto& c = chunks[i];
             for_lines<2>(*c.in, c.s, c.e, [&](Field (&f)[2]) {
@@ -773,18 +776,19 @@ struct Pipeline {
 }  // namespace ss
 
 // Big containers (the persons map, dedup tables, session arrays, output
-// buffers) get huge pages like the arena does.
+// buffers) get their own huge-page mappings, like the arena.
 void* operator new(size_t n) {
-    void* p = std::malloc(n ? n : 1);
+    void* p = n >= ss::kBigAlloc ? ss::big_alloc(n) : std::malloc(n ? n : 1);
     if (!p) ss::die("out of memory (%zu bytes)", n);
-    if (n >= (size_t(2) << 20)) ss::advise_huge(p, n);
     return p;
 }
 void* operator new[](size_t n) { return operator new(n); }
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete[](void* p) noexcept { std::free(p); }
-void operator delete(void* p, size_t) noexcept { std::free(p); }
-void operator delete[](void* p, size_t) noexcept { std::free(p); }
+void operator delete(void* p) noexcept {
+    if (!ss::big_free(p)) std::free(p);
+}
+void operator delete[](void* p) noexcept { operator delete(p); }
+void operator delete(void* p, size_t) noexcept { operator delete(p); }
+void operator delete[](void* p, size_t) noexcept { operator delete(p); }
 
 // CPUs this process may use: the hardware count, limited by the affinity
 // mask and a cgroup CPU quota (hardware_concurrency() sees neither, so a

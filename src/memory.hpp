@@ -66,16 +66,44 @@ inline std::vector<std::string> csv_files(const std::filesystem::path& dir) {
     return out;
 }
 
-// Asks for transparent huge pages on the 2 MB-aligned interior of a big
-// untouched allocation (the scorer's THP mode may be "madvise").
-inline void advise_huge(void* p, size_t n) {
+// Allocations of 1 MB or more get their own 2 MB-aligned mapping with huge
+// pages asked for (so first touches fault in 2 MB at a time, not 4 KB). A
+// 64-byte header in front records the mapping; such a block is the only kind
+// whose address is 64 bytes past a 2 MB boundary with the magic in front
+// (malloc returns 16 bytes past a chunk header).
+constexpr size_t kBigAlloc = size_t(1) << 20;
+constexpr uintptr_t kHugePage = uintptr_t(2) << 20;
+constexpr u64 kBigMagic = 0x6c6c612d67696273ULL;
+struct BigHeader {
+    u64 magic;
+    void* base;
+    size_t len;
+    u64 pad[5];
+};
+static_assert(sizeof(BigHeader) == 64);
+
+inline void* big_alloc(size_t n) {
+    size_t len = (n + sizeof(BigHeader) + kHugePage - 1) / kHugePage * kHugePage + kHugePage;
+    void* raw = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    if (raw == MAP_FAILED) return nullptr;
+    uintptr_t aligned = (uintptr_t(raw) + kHugePage - 1) & ~(kHugePage - 1);
 #ifdef __linux__
-    constexpr uintptr_t huge = uintptr_t(2) << 20;
-    uintptr_t a = (uintptr_t(p) + huge - 1) & ~(huge - 1), b = (uintptr_t(p) + n) & ~(huge - 1);
-    if (b > a) madvise(reinterpret_cast<void*>(a), b - a, MADV_HUGEPAGE);
-#else
-    (void)p, (void)n;
+    madvise(reinterpret_cast<void*>(aligned), uintptr_t(raw) + len - aligned, MADV_HUGEPAGE);
 #endif
+    auto* h = reinterpret_cast<BigHeader*>(aligned);
+    h->magic = kBigMagic;
+    h->base = raw;
+    h->len = len;
+    return h + 1;
+}
+// Frees p if big_alloc made it; false otherwise.
+inline bool big_free(void* p) {
+    if (!p || (uintptr_t(p) & (kHugePage - 1)) != sizeof(BigHeader)) return false;
+    auto* h = static_cast<BigHeader*>(p) - 1;
+    if (h->magic != kBigMagic) return false;
+    h->magic = 0;
+    munmap(h->base, h->len);
+    return true;
 }
 
 // ---------------------------------------------------------------- arena
@@ -152,48 +180,51 @@ public:
     static constexpr u32 kBlock = 128;
 
 private:
-    struct Bucket {
+    // The hot half of a bucket (written on every push) is kept apart from
+    // its block list, so 2048 buckets' cursors fit in 32 KB of L1.
+    struct Cursor {
         T* cur = nullptr;
         u32 fill = kBlock;
-        std::vector<T*> blocks;
     };
     Arena arena_;
-    std::vector<Bucket> buckets_;
+    std::vector<Cursor> cursors_;
+    std::vector<std::vector<T*>> blocks_;
 
-    [[gnu::noinline]] void grow(Bucket& b) {
-        b.cur = static_cast<T*>(arena_.alloc(sizeof(T) * kBlock));
-        b.fill = 0;
-        b.blocks.push_back(b.cur);
+    [[gnu::noinline]] void grow(size_t i) {
+        Cursor& c = cursors_[i];
+        c.cur = static_cast<T*>(arena_.alloc(sizeof(T) * kBlock));
+        c.fill = 0;
+        blocks_[i].push_back(c.cur);
     }
 
 public:
-    explicit Scatter(size_t n = 1) : buckets_(n) {}
+    explicit Scatter(size_t n = 1) : cursors_(n), blocks_(n) {}
     Arena& arena() { return arena_; }
     // Hands bucket i's blocks to `to` for reuse; nothing may read them afterwards.
     void recycle_bucket(size_t i, Arena& to) const {
-        for (T* p : buckets_[i].blocks) to.recycle(p, sizeof(T) * kBlock);
+        for (T* p : blocks_[i]) to.recycle(p, sizeof(T) * kBlock);
     }
     inline void push(size_t i, const T& x) {
-        Bucket& b = buckets_[i];
-        if (b.fill == kBlock) [[unlikely]] grow(b);
-        b.cur[b.fill++] = x;
+        Cursor& c = cursors_[i];
+        if (c.fill == kBlock) [[unlikely]] grow(i);
+        c.cur[c.fill++] = x;
     }
     size_t size(size_t i) const {
-        auto& b = buckets_[i];
-        return b.blocks.empty() ? 0 : (b.blocks.size() - 1) * kBlock + b.fill;
+        size_t n = blocks_[i].size();
+        return n == 0 ? 0 : (n - 1) * kBlock + cursors_[i].fill;
     }
-    size_t num_blocks(size_t i) const { return buckets_[i].blocks.size(); }
+    size_t num_blocks(size_t i) const { return blocks_[i].size(); }
     // Block j of bucket i and its length.
     std::pair<const T*, u32> block(size_t i, size_t j) const {
-        auto& b = buckets_[i];
-        return {b.blocks[j], j + 1 == b.blocks.size() ? b.fill : kBlock};
+        auto& b = blocks_[i];
+        return {b[j], j + 1 == b.size() ? cursors_[i].fill : kBlock};
     }
     template <class F>
     void for_each(size_t i, F f) const {
-        auto& b = buckets_[i];
-        for (size_t j = 0; j < b.blocks.size(); ++j) {
-            const T* p = b.blocks[j];
-            u32 n = j + 1 == b.blocks.size() ? b.fill : kBlock;
+        auto& b = blocks_[i];
+        for (size_t j = 0; j < b.size(); ++j) {
+            const T* p = b[j];
+            u32 n = j + 1 == b.size() ? cursors_[i].fill : kBlock;
             for (u32 k = 0; k < n; ++k) f(p[k]);
         }
     }
