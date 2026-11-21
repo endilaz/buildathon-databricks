@@ -1,312 +1,661 @@
-#include "aggregate.hpp"
-#include "dedup.hpp"
-#include "output.hpp"
-#include <array>
-#include <chrono>
-#include <cstdlib>
-#include <iostream>
+// Shopping Sessions pipeline.
+//
+//   links    parse in parallel; union-find on a helper thread during the parse
+//   parse    one pass over events and clicks; events scatter by event_id hash
+//   dedup    per event_id bucket: earliest ingest wins, then valid survivors
+//            and clicks scatter by person hash
+//   sessions per person bucket: group by person, sessions, credit, assists
+//   output   hand-written Parquet, one user_daily file per worker
+#include "parquet.hpp"
+#include "sessions.hpp"
+#include "table.hpp"
 #include <map>
 
-namespace fs = std::filesystem;
+namespace ss {
+namespace {
 
-namespace shopping {
+constexpr u32 kInvalid = UINT32_MAX;
+constexpr int kPrefetch = 32;               // person lookups issued this many records ahead
+constexpr size_t kEventBucketLines = 32768;  // event_id buckets: about this many lines each
+constexpr size_t kPersonBucketEvents = 16384;  // person buckets: about this many events each
 
-constexpr size_t partitions = 64;
-constexpr int64_t day_ms = 86400000;
-constexpr int64_t week_ms = 7 * day_ms;
+#pragma pack(push, 8)
+struct EventRec {  // one parsed event line; cat == kInvalid when it fails validation
+    Key eid, user;
+    i64 ingest, ts;
+    u32 price, cat;
+};
+struct ClickRec {
+    Key cid, user;
+    i64 ts;
+    u32 camp;
+};
+template <class E>
+struct PersonEvent {
+    Key person;
+    E ev;
+};
+struct PersonClick {
+    Key person, cid;
+    i64 ts;
+    u32 camp;
+};
+#pragma pack(pop)
+
+// ---------------------------------------------------------------- catalog
 
 struct Catalog {
-    MappedFile products_file, campaigns_file;
-    std::vector<Text> categories, campaigns, channels;
-    std::unordered_map<Text, Index> products, campaign_index;
-    Index unknown, organic;
-    explicit Catalog(const fs::path& dir)
-        : products_file(dir / "products.csv"), campaigns_file(dir / "campaigns.csv") {
-        std::map<Text, Index> ranks;
-        ranks.emplace("unknown", 0);
-        std::vector<std::pair<Text, Text>> pairs;
-        CsvReader product_rows(csv_data(products_file.view()));
-        CsvFields<2> f;
-        Text line;
-        while (product_rows.next(line)) {
-            if (f.parse(line)) {
-                ranks.emplace(f[1], 0);
-                pairs.emplace_back(f[0], f[1]);
-            }
-        }
-        for (auto& [name, rank] : ranks) {
-            rank = as_index(categories.size());
-            categories.push_back(name);
-        }
-        unknown = ranks.at("unknown");
-        products.reserve(pairs.size());
-        for (auto [product, category] : pairs) products.emplace(product, ranks.at(category));
-        CsvReader campaign_rows(csv_data(campaigns_file.view()));
-        while (campaign_rows.next(line)) {
-            if (!f.parse(line)) continue;
-            campaign_index.emplace(f[0], as_index(campaigns.size()));
-            campaigns.push_back(f[0]);
-            channels.push_back(f[1]);
-        }
-        organic = as_index(campaigns.size());
-        campaigns.emplace_back("organic");
-        channels.emplace_back("organic");
-    }
-};
+    std::vector<std::string> categories;  // sorted byte-wise; index = rank
+    u32 unknown = 0;
+    KeyMap<u32> products;
+    bool numbered = false;        // products named <prefix><decimal> use by_number
+    char prefix = 0;
+    std::vector<u16> by_number;   // 0xFFFF: no such product
+    KeyMap<u32> campaigns;
+    std::vector<Key> campaign_ids;
+    std::vector<std::string> channels;
 
-struct Candidate { Text id, line; int64_t ingest; };
-struct Records { std::vector<Event> events; std::vector<Click> clicks; };
-struct Worker : Records {
-    LocalPeople people;
-    std::array<std::vector<Candidate>, partitions> repeated;
-};
+    static bool product_number(Field id, char prefix, u32& num) { return prefixed_number(id, prefix, num); }
 
-class Job {
-    Window window_;
-    Files links_, events_, clicks_;
-    People linked_;
-    std::vector<Text> names_;
-    Index first_single_ = 0;
-    Catalog catalog_;
-    size_t threads_;
-    std::vector<Worker> workers_;
-    std::array<Records, partitions> groups_;
-    bool profile_;
-    std::chrono::steady_clock::time_point mark_ = std::chrono::steady_clock::now();
+    u32 category(Field pid) const {
+        u32 num;
+        if (numbered && product_number(pid, prefix, num) && num < (1u << 22)) {
+            if (num >= by_number.size()) return unknown;
+            u16 c = by_number[num];
+            return c == 0xFFFF ? unknown : c;
+        }
+        const u32* c = products.find(make_key(pid));
+        return c ? *c : unknown;
+    }
 
-    void mark(const char* stage) {
-        auto now = std::chrono::steady_clock::now();
-        if (profile_) std::cerr << stage << " " << std::chrono::duration<double>(now - mark_).count() << " s\n";
-        mark_ = now;
-    }
-    void link_people() {
-        for (auto chunk : links_.chunks) {
-            CsvReader rows(chunk);
-            CsvFields<2> f;
-            Text line;
-            while (rows.next(line)) {
-                if (f.parse(line) && !f[0].empty() && !f[1].empty()) linked_.link(f[0], f[1]);
-            }
-        }
-        names_ = linked_.finalize();
-        first_single_ = as_index(names_.size());
-    }
-    void keep(Worker& worker, const CsvFields<7>& f, int64_t ingest) {
-        int64_t ts;
-        if (f[1].empty() || f[5].empty() || !parse_timestamp(f[2], ts) ||
-            ts < window_.start || ts >= window_.end || ingest - ts > day_ms) return;
-        int64_t price = 0;
-        Index category = catalog_.unknown;
-        if (f[4] == "purchase") {
-            if (!parse_i64(f[6], price) || price < 1 || price > 10000000) return;
-            auto it = catalog_.products.find(f[5]);
-            if (it != catalog_.products.end()) category = it->second;
-        } else if (f[4] != "view" && f[4] != "cart") {
-            return;
-        }
-        Event event{};
-        event.person = worker.people.get(f[1], linked_, first_single_);
-        event.ts = ts;
-        event.price = static_cast<int32_t>(price);
-        event.category = category;
-        worker.events.push_back(event);
-    }
-    void read_events(const DuplicateFilter& duplicates) {
-        parallel(threads_, events_.chunks.size(), [&](size_t tid, size_t i) {
-            auto& worker = workers_[tid];
-            CsvReader rows(events_.chunks[i]);
-            CsvFields<7> f;
-            Text line;
-            while (rows.next(line)) {
-                if (!f.parse(line) || f[0].empty()) continue;
-                int64_t ingest;
-                if (!parse_timestamp(f[3], ingest)) continue; // Guaranteed valid F1 by the input contract.
-                if (duplicates.maybe_repeated(f[0])) {
-                    auto shard = std::hash<Text>{}(f[0]) % partitions;
-                    worker.repeated[shard].push_back({f[0], line, ingest});
-                } else {
-                    keep(worker, f, ingest);
-                }
-            }
+    explicit Catalog(const std::string& dir) {
+        Input pf = map_input(dir + "/products.csv");
+        std::vector<std::pair<Field, Field>> rows;
+        for_lines<2>(pf, 0, pf.len, [&](Field (&f)[2]) {
+            if (!f[0].empty()) rows.emplace_back(f[0], f[1]);
         });
-    }
-    void resolve_duplicates() {
-        parallel(threads_, partitions, [&](size_t tid, size_t shard) {
-            size_t count = 0;
-            for (auto& w : workers_) count += w.repeated[shard].size();
-            std::unordered_map<Text, const Candidate*> winners;
-            winners.reserve(count);
-            for (auto& w : workers_) {
-                for (auto& candidate : w.repeated[shard]) {
-                    auto [it, fresh] = winners.try_emplace(candidate.id, &candidate);
-                    if (!fresh && candidate.ingest < it->second->ingest) it->second = &candidate;
-                }
-            }
-            CsvFields<7> f;
-            for (auto [id, chosen] : winners) {
-                f.parse(chosen->line);
-                keep(workers_[tid], f, chosen->ingest);
-            }
-            for (auto& w : workers_) std::vector<Candidate>().swap(w.repeated[shard]);
-        });
-    }
-    void read_clicks() {
-        parallel(threads_, clicks_.chunks.size(), [&](size_t tid, size_t i) {
-            auto& worker = workers_[tid];
-            CsvReader rows(clicks_.chunks[i]);
-            CsvFields<4> f;
-            Text line;
-            while (rows.next(line)) {
-                if (!f.parse(line) || f[0].empty() || f[1].empty()) continue;
-                int64_t ts;
-                if (!parse_timestamp(f[3], ts) || ts < window_.start - week_ms || ts >= window_.end) continue;
-                auto campaign = catalog_.campaign_index.find(f[2]);
-                if (campaign == catalog_.campaign_index.end()) continue;
-                Click click{};
-                click.person = worker.people.get(f[1], linked_, first_single_);
-                click.ts = ts;
-                click.campaign = campaign->second;
-                click.id = f[0];
-                worker.clicks.push_back(click);
-            }
-        });
-    }
-    template<class T>
-    void distribute(std::vector<T> Records::* field) {
-        using Counts = std::array<size_t, partitions>;
-        std::vector<Counts> offsets(workers_.size());
-        parallel(threads_, workers_.size(), [&](size_t, size_t i) {
-            for (auto& row : workers_[i].*field) {
-                row.person = workers_[i].people.global(row.person, first_single_);
-                ++offsets[i][row.person % partitions];
-            }
-        });
-        for (size_t p = 0; p < partitions; ++p) {
-            size_t total = 0;
-            for (auto& counts : offsets) {
-                auto n = counts[p];
-                counts[p] = total;
-                total += n;
-            }
-            (groups_[p].*field).resize(total);
-        }
-        parallel(threads_, workers_.size(), [&](size_t, size_t i) {
-            for (auto& row : workers_[i].*field) {
-                auto p = row.person % partitions;
-                (groups_[p].*field)[offsets[i][p]++] = row;
-            }
-            std::vector<T>().swap(workers_[i].*field);
-        });
-    }
-    void partition() {
-        NameIndex global;
-        for (auto& w : workers_) {
-            w.people.remap.reserve(w.people.names.size());
-            for (auto name : w.people.names) {
-                Index next = as_index(names_.size());
-                Index id = global.get(name, next);
-                if (id == next) names_.push_back(name);
-                w.people.remap.push_back(id);
+        // distinct category names, then ranks in byte-wise order
+        std::unordered_map<std::string_view, u32> rank{{"unknown", 0}};
+        for (auto& r : rows) rank.try_emplace(r.second, 0);
+        for (auto& [name, r] : rank) categories.emplace_back(name);
+        std::sort(categories.begin(), categories.end());
+        for (u32 i = 0; i < categories.size(); ++i) rank[categories[i]] = i;
+        unknown = rank.at("unknown");
+        size_t first[256] = {};
+        for (auto& r : rows) ++first[u8(r.first[0])];
+        prefix = char(std::max_element(first, first + 256) - first);
+        numbered = categories.size() < 0xFFFF;
+        products.reset(rows.size());
+        for (auto& r : rows) {
+            u32 c = rank.at(r.second);
+            products.insert(make_key(r.first), c);
+            u32 num;
+            if (numbered && product_number(r.first, prefix, num) && num < (1u << 22)) {
+                if (num >= by_number.size()) by_number.resize(num + 1, 0xFFFF);
+                by_number[num] = u16(c);
             }
         }
-        distribute(&Records::events);
-        distribute(&Records::clicks);
-        std::vector<Worker>().swap(workers_);
-    }
-    void aggregate_and_write(const fs::path& out);
-public:
-    Job(const fs::path& data, size_t threads, bool profile)
-        : window_(read_manifest(data / "manifest.json")), links_(data / "links"), events_(data / "events"),
-          clicks_(data / "clicks"), catalog_(data), threads_(threads), workers_(threads), profile_(profile) {}
-    void run(const fs::path& output) {
-        link_people(); mark("links");
-        {
-            DuplicateFilter duplicates(events_, threads_); mark("duplicate filter");
-            read_events(duplicates); mark("event parse");
-        }
-        resolve_duplicates(); mark("duplicate resolution");
-        read_clicks(); mark("click parse");
-        partition(); mark("person partition");
-        aggregate_and_write(output); mark("parquet output");
-    }
-};
 
-} // namespace shopping
-
-namespace shopping {
-
-void Job::aggregate_and_write(const fs::path& out) {
-    fs::create_directories(out / "user_daily");
-    fs::create_directories(out / "campaign_daily");
-    std::array<AggregateResult, partitions> results;
-    parallel(threads_, partitions, [&](size_t, size_t i) {
-        results[i] = aggregate(groups_[i].events, groups_[i].clicks, catalog_.categories.size(), catalog_.organic);
-        groups_[i] = Records{};
-    });
-    mark("sessionization and attribution");
-    bool any_users = false;
-    for (auto& result : results) any_users |= !result.users.empty();
-    parallel(threads_, partitions, [&](size_t, size_t i) {
-        auto& users = results[i].users;
-        auto path = out / "user_daily" / ("part-" + std::to_string(i) + ".parquet");
-        if (users.empty() && (i != 0 || any_users)) {
-            fs::remove(path); // A previous run can have had data in this partition.
-            return;
-        }
-        output::write(path, true, users.size(), [&](output::Batch& b, size_t offset) {
-            auto row = [&](size_t j) -> const auto& { return users[offset+j]; };
-            b.strings([&](auto j) { return names_[row(j).person]; });
-            b.values<parquet::Int32Type>([&](auto j) { return row(j).day; });
-            b.values<parquet::Int64Type>([&](auto j) { return row(j).sessions; });
-            b.values<parquet::Int64Type>([&](auto j) { return row(j).events; });
-            b.values<parquet::Int64Type>([&](auto j) { return row(j).revenue; });
-            b.nullable_strings([&](auto j) -> std::optional<Text> {
-                if (row(j).revenue == 0) return {};
-                return catalog_.categories[row(j).top_category];
+        Input cf = map_input(dir + "/campaigns.csv");
+        for_lines<2>(cf, 0, cf.len, [&](Field (&f)[2]) {
+            if (f[0].empty()) return;
+            Key k = make_key(f[0]);
+            u32& idx = campaigns.get_or_insert(k, [&] {
+                campaign_ids.push_back(k);
+                channels.emplace_back();
+                return u32(campaign_ids.size() - 1);
             });
+            channels[idx] = std::string(f[1]);
         });
-    });
-    std::map<std::pair<Index, int32_t>, CampaignRow> merged;
-    for (auto& result : results) {
-        for (auto& row : result.campaigns) {
-            auto& sum = merged[{row.campaign, row.day}];
-            sum.campaign = row.campaign;
-            sum.day = row.day;
-            sum.sessions += row.sessions;
-            sum.purchasing_sessions += row.purchasing_sessions;
-            sum.revenue += row.revenue;
-            sum.assisted_sessions += row.assisted_sessions;
-        }
+        // product and campaign keys were copied; the mappings stay for Fields in rows
     }
-    std::vector<CampaignRow> campaigns;
-    campaigns.reserve(merged.size());
-    for (auto& entry : merged) campaigns.push_back(entry.second);
-    output::write(out / "campaign_daily" / "part-0.parquet", false, campaigns.size(),
-        [&](output::Batch& b, size_t offset) {
-            auto row = [&](size_t j) -> const auto& { return campaigns[offset+j]; };
-            b.strings([&](auto j) { return catalog_.campaigns[row(j).campaign]; });
-            b.strings([&](auto j) { return catalog_.channels[row(j).campaign]; });
-            b.values<parquet::Int32Type>([&](auto j) { return row(j).day; });
-            b.values<parquet::Int64Type>([&](auto j) { return row(j).sessions; });
-            b.values<parquet::Int64Type>([&](auto j) { return row(j).purchasing_sessions; });
-            b.values<parquet::Int64Type>([&](auto j) { return row(j).revenue; });
-            b.values<parquet::Int64Type>([&](auto j) { return row(j).assisted_sessions; });
-        });
+};
+
+// ---------------------------------------------------------------- links
+
+struct Persons {
+    KeyMap<Key> map;  // every ID in a kept link line -> its person's name
+    Key name(Key user) const {
+        const Key* v = map.find(user);
+        return v ? *v : user;
+    }
+};
+
+inline Persons build_persons(std::vector<std::vector<std::pair<Key, Key>>>& pairs) {
+    size_t n = 0;
+    for (auto& v : pairs) n += v.size();
+    Persons out;
+    out.map.reset(n + n / 2 + 16);
+    std::vector<Key> keys;
+    std::vector<u32> parent;
+    keys.reserve(n);
+    parent.reserve(n);
+    auto id = [&](Key k) {
+        return u32(out.map.get_or_insert(k, [&] {
+            keys.push_back(k);
+            parent.push_back(u32(keys.size() - 1));
+            return Key(keys.size() - 1);
+        }));
+    };
+    auto find = [&](u32 x) {
+        while (parent[x] != x) {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        return x;
+    };
+    for (auto& v : pairs) {
+        for (auto& [a, b] : v) {
+            u32 ra = find(id(a)), rb = find(id(b));
+            if (ra != rb) parent[std::max(ra, rb)] = std::min(ra, rb);
+        }
+        std::vector<std::pair<Key, Key>>().swap(v);
+    }
+    std::vector<Key> best(keys);
+    for (u32 i = 0; i < keys.size(); ++i) {
+        u32 r = find(i);
+        if (key_less(keys[i], best[r])) best[r] = keys[i];
+    }
+    out.map.for_each([&](Key, Key& v) { v = best[find(u32(v))]; });
+    return out;
 }
 
-} // namespace shopping
+// ---------------------------------------------------------------- chunks
 
-int main() {
-    try {
-        const auto* data = std::getenv("DATA_DIR");
-        const auto* output = std::getenv("OUTPUT_DIR");
-        const auto* threads = std::getenv("NCPU");
-        const int count = threads ? std::stoi(threads) : 8;
-        shopping::Job job(data ? data : "/data", std::clamp(count, 1, 8), std::getenv("SHOPPING_PROFILE") != nullptr);
-        job.run(output ? output : "/output");
-        return 0;
-    } catch (const std::exception& e) {
-        std::cerr << "shopping-sessions: " << e.what() << '\n';
-        return 1;
+struct Chunk {
+    const Input* in;
+    size_t s, e;
+};
+
+inline void plan_chunks(const std::vector<Input>& files, size_t target, std::vector<Chunk>& out) {
+    for (auto& f : files) {
+        if (!f.len) continue;
+        size_t parts = std::max<size_t>(1, (f.len + target - 1) / target);
+        size_t step = (f.len + parts - 1) / parts;
+        for (size_t s = 0; s < f.len; s += step) out.push_back({&f, s, std::min(f.len, s + step)});
     }
+}
+
+inline size_t pow2_at_least(size_t n) {
+    size_t p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+inline u32 log2_exact(size_t p) { return u32(__builtin_ctzll(p)); }
+
+// ---------------------------------------------------------------- pipeline
+
+struct Pipeline {
+    std::string data_dir, out_dir;
+    size_t threads;
+    Timer timer;
+    Window w{};
+    Catalog* catalog = nullptr;
+    std::vector<Input> link_files, event_files, click_files;
+
+    struct ParseState {
+        Scatter<EventRec> ev;
+        Scatter<ClickRec> ck{1};
+        explicit ParseState(size_t buckets) : ev(buckets) {}
+    };
+    std::vector<ParseState> parsed;
+    size_t event_buckets = 0;
+    u32 event_shift = 0;
+    Persons persons;
+
+    Pipeline(std::string d, std::string o, size_t t, bool profile)
+        : data_dir(std::move(d)), out_dir(std::move(o)), threads(t), timer(profile) {}
+
+    void read_manifest() {
+        Input m = map_input(data_dir + "/manifest.json");
+        std::string_view json(m.data, m.len);
+        auto get = [&](std::string_view name) {
+            size_t k = json.find("\"" + std::string(name) + "\"");
+            size_t colon = k == json.npos ? k : json.find(':', k + name.size() + 2);
+            size_t a = colon == json.npos ? colon : json.find('"', colon + 1);
+            size_t b = a == json.npos ? a : json.find('"', a + 1);
+            i64 v;
+            if (b == json.npos || !parse_ts(json.substr(a + 1, b - a - 1), v))
+                die("bad manifest field %s", std::string(name).c_str());
+            return v;
+        };
+        w.start = get("window_start");
+        w.end = get("window_end");
+        w.click_start = w.start - kWeek;
+        w.day0 = floor_div(w.start, kDay);
+        w.days = w.end > w.start ? u32(floor_div(w.end - 1, kDay) - w.day0 + 1) : 1;
+        unmap_input(m);
+    }
+
+    void parse_event(Field (&f)[7], Scatter<EventRec>& out) {
+        if (f[0].empty()) return;
+        i64 ingest;
+        if (!parse_f1(f[3], ingest)) return;
+        EventRec r{make_key(f[0]), 0, ingest, 0, 0, kInvalid};
+        i64 ts;
+        if (!f[1].empty() && !f[5].empty() && parse_ts(f[2], ts) && ts >= w.start && ts < w.end &&
+            ingest - ts <= kDay) {
+            // event_type by fixed-width loads (fields are followed by padding)
+            Field type = f[4];
+            bool ok = false;
+            u32 price = 0;
+            if (type.size() == 8) {
+                ok = load64(type.data()) == load64("purchase") && parse_price(f[6], price);
+            } else if (type.size() == 4) {
+                u32 t;
+                std::memcpy(&t, type.data(), 4);
+                ok = t == load32("view") || t == load32("cart");
+            }
+            if (ok) {
+                r.user = make_key(f[1]);
+                r.ts = ts;
+                r.price = price;
+                r.cat = catalog->category(f[5]);
+            }
+        }
+        out.push(size_t(key_hash(r.eid) >> event_shift), r);
+    }
+
+    void parse_click(Field (&f)[4], Scatter<ClickRec>& out) {
+        if (f[0].empty() || f[1].empty() || f[2].empty()) return;
+        const u32* camp = catalog->campaigns.find(make_key(f[2]));
+        if (!camp) return;
+        i64 ts;
+        if (!parse_ts(f[3], ts) || ts < w.click_start || ts >= w.end) return;
+        out.push(0, ClickRec{make_key(f[0]), make_key(f[1]), ts, *camp});
+    }
+
+    void run() {
+        read_manifest();
+        std::thread catalog_thread([&] { catalog = new Catalog(data_dir); });
+        auto map_dir = [&](const char* name) {
+            std::vector<Input> v;
+            for (auto& p : csv_files(data_dir + "/" + name)) v.push_back(map_input(p));
+            return v;
+        };
+        link_files = map_dir("links");
+        event_files = map_dir("events");
+        click_files = map_dir("clicks");
+        size_t ev_bytes = 0, ck_bytes = 0;
+        for (auto& f : event_files) ev_bytes += f.len;
+        for (auto& f : click_files) ck_bytes += f.len;
+        Reservation::global().reserve(2 * ev_bytes + 2 * ck_bytes + (threads << 28) + (size_t(256) << 20));
+        timer.lap("setup");
+
+        // links
+        std::vector<Chunk> chunks;
+        plan_chunks(link_files, size_t(1) << 20, chunks);
+        std::vector<std::vector<std::pair<Key, Key>>> link_pairs(threads);
+        run_tasks(link_pairs, chunks.size(), [&](auto& out, size_t i) {
+            auto& c = chunks[i];
+            for_lines<2>(*c.in, c.s, c.e, [&](Field (&f)[2]) {
+                if (!f[0].empty() && !f[1].empty()) out.emplace_back(make_key(f[0]), make_key(f[1]));
+            });
+        });
+        catalog_thread.join();
+        timer.lap("links");
+
+        // parse events and clicks while the persons are built
+        size_t est_lines = ev_bytes / 72 + 1;
+        event_buckets = std::clamp<size_t>(pow2_at_least(est_lines / kEventBucketLines), 16, 4096);
+        event_shift = 64 - log2_exact(event_buckets);
+        chunks.clear();
+        plan_chunks(event_files, size_t(4) << 20, chunks);
+        size_t event_chunks = chunks.size();
+        plan_chunks(click_files, size_t(4) << 20, chunks);
+        std::thread persons_thread([&] { persons = build_persons(link_pairs); });
+        parsed.reserve(threads);
+        for (size_t t = 0; t < threads; ++t) parsed.emplace_back(event_buckets);
+        run_tasks(parsed, chunks.size(), [&](ParseState& st, size_t i) {
+            auto& c = chunks[i];
+            populate(*c.in, c.s, c.e + 4096);
+            if (i < event_chunks)
+                for_lines<7>(*c.in, c.s, c.e, [&](Field (&f)[7]) { parse_event(f, st.ev); });
+            else
+                for_lines<4>(*c.in, c.s, c.e, [&](Field (&f)[4]) { parse_click(f, st.ck); });
+        });
+        persons_thread.join();
+        timer.lap("parse");
+        // the records hold keys, not pointers: release the inputs off the critical path
+        std::thread([files = std::move(event_files), clicks = std::move(click_files),
+                     links = std::move(link_files)] {
+            for (auto* v : {&files, &clicks, &links})
+                for (auto& f : *v) unmap_input(f);
+        }).detach();
+
+        bool small = catalog->categories.size() <= 256 && w.end - w.click_start < (i64(1) << 32);
+        if (small)
+            finish<u64>();
+        else
+            finish<u128>();
+    }
+
+    template <class E>
+    void finish() {
+        using P = Pack<E>;
+        // ---- dedup events, map events and clicks to persons, scatter by person
+        size_t total_events = 0;
+        for (auto& p : parsed)
+            for (size_t b = 0; b < event_buckets; ++b) total_events += p.ev.size(b);
+        size_t person_buckets = std::clamp<size_t>(pow2_at_least(total_events / kPersonBucketEvents), 16, 8192);
+        u32 person_shift = 64 - log2_exact(person_buckets);
+        constexpr size_t kClickTaskBlocks = 256;
+        std::vector<std::pair<size_t, size_t>> click_tasks;  // (thread, first block)
+        for (size_t t = 0; t < parsed.size(); ++t)
+            for (size_t j = 0; j < parsed[t].ck.num_blocks(0); j += kClickTaskBlocks) click_tasks.emplace_back(t, j);
+
+        struct DedupState {
+            Scatter<PersonEvent<E>> ev;
+            Scatter<PersonClick> ck;
+            std::vector<u64> table, wins;
+            std::vector<const EventRec*> blocks;
+            explicit DedupState(size_t n) : ev(n), ck(n) {}
+        };
+        std::vector<DedupState> dedup;
+        dedup.reserve(threads);
+        for (size_t t = 0; t < threads; ++t) dedup.emplace_back(person_buckets);
+        const i64 ws = w.start;
+        run_tasks(dedup, event_buckets + click_tasks.size(), [&](DedupState& st, size_t task) {
+            if (task < event_buckets) {
+                size_t b = task;
+                st.blocks.clear();
+                size_t n = 0;
+                for (auto& p : parsed) {
+                    for (size_t j = 0; j < p.ev.num_blocks(b); ++j) st.blocks.push_back(p.ev.block(b, j).first);
+                    n += p.ev.size(b);
+                }
+                if (!n) return;
+                // block lengths: every block is full except each thread's last
+                std::vector<u32> lens;
+                lens.reserve(st.blocks.size());
+                for (auto& p : parsed)
+                    for (size_t j = 0; j < p.ev.num_blocks(b); ++j) lens.push_back(p.ev.block(b, j).second);
+                size_t cap = pow2_at_least(2 * n), mask = cap - 1;
+                st.table.assign(cap, 0);
+                st.wins.assign((st.blocks.size() * Scatter<EventRec>::kBlock + 63) / 64, 0);
+                auto rec = [&](u64 ref) -> const EventRec& { return st.blocks[ref >> 7][ref & 127]; };
+                for (size_t bi = 0; bi < st.blocks.size(); ++bi) {
+                    const EventRec* blk = st.blocks[bi];
+                    for (u32 i = 0; i < lens[bi]; ++i) {
+                        const EventRec& r = blk[i];
+                        u64 ref = (u64(bi) << 7) | i;
+                        u64 h = key_hash(r.eid);
+                        u64 tag = h >> 32;
+                        u64 entry = (tag << 32) | (ref + 1);
+                        u64 valid = r.cat != kInvalid;
+                        for (size_t s = h & mask;; s = (s + 1) & mask) {
+                            u64 cur = st.table[s];
+                            if (!cur) {
+                                st.table[s] = entry;
+                                st.wins[ref >> 6] |= valid << (ref & 63);
+                                break;
+                            }
+                            if ((cur >> 32) == tag) {
+                                u64 old = (cur & 0xFFFFFFFFu) - 1;
+                                const EventRec& o = rec(old);
+                                if (o.eid == r.eid) {
+                                    if (r.ingest < o.ingest) {
+                                        st.table[s] = entry;
+                                        st.wins[old >> 6] &= ~(u64(1) << (old & 63));
+                                        st.wins[ref >> 6] |= valid << (ref & 63);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                // survivors in memory order; person lookups prefetched ahead
+                struct Pending {
+                    Key user;
+                    E ev;
+                };
+                Pending ring[kPrefetch];
+                size_t count = 0;
+                auto emit = [&](const Pending& x) {
+                    Key person = persons.name(x.user);
+                    st.ev.push(size_t(key_hash(person) >> person_shift), PersonEvent<E>{person, x.ev});
+                };
+                for (size_t wi = 0; wi < st.wins.size(); ++wi) {
+                    for (u64 bits = st.wins[wi]; bits; bits &= bits - 1) {
+                        const EventRec& r = rec((u64(wi) << 6) | u64(__builtin_ctzll(bits)));
+                        Pending x{r.user, P::event(u64(r.ts - ws), r.cat, r.price)};
+                        persons.map.prefetch_key(x.user);
+                        if (count >= kPrefetch) emit(ring[count % kPrefetch]);
+                        ring[count % kPrefetch] = x;
+                        ++count;
+                    }
+                }
+                for (size_t i = count > kPrefetch ? count - kPrefetch : 0; i < count; ++i) emit(ring[i % kPrefetch]);
+                // this task was bucket b's only reader: its (faulted-in) blocks take the next pushes
+                for (auto& p : parsed) p.ev.recycle_bucket(b, st.ev.arena());
+            } else {
+                st.ck.arena().take_free(st.ev.arena());  // event tasks all come first
+                auto [t, first] = click_tasks[task - event_buckets];
+                auto& src = parsed[t].ck;
+                size_t last = std::min(src.num_blocks(0), first + kClickTaskBlocks);
+                for (size_t j = first; j < last; ++j) {
+                    auto [blk, len] = src.block(0, j);
+                    for (u32 i = 0; i < len && i < kPrefetch; ++i) persons.map.prefetch_key(blk[i].user);
+                    for (u32 i = 0; i < len; ++i) {
+                        if (i + kPrefetch < len) persons.map.prefetch_key(blk[i + kPrefetch].user);
+                        const ClickRec& c = blk[i];
+                        Key person = persons.name(c.user);
+                        st.ck.push(size_t(key_hash(person) >> person_shift), PersonClick{person, c.cid, c.ts, c.camp});
+                    }
+                }
+            }
+        });
+        timer.lap("dedup");
+
+        // ---- sessions per person bucket, biggest buckets first
+        const u32 ncamp = u32(catalog->campaign_ids.size());
+        const u32 ncat = u32(catalog->categories.size());
+        std::vector<std::pair<size_t, u32>> order(person_buckets);
+        for (size_t p = 0; p < person_buckets; ++p) {
+            size_t n = 0;
+            for (auto& d : dedup) n += d.ev.size(p) + d.ck.size(p);
+            order[p] = {n, u32(p)};
+        }
+        std::sort(order.begin(), order.end(), [](auto& a, auto& b) { return a.first > b.first; });
+
+        struct SessionState {
+            PersonWork<E> work;
+            KeyMap<u32> local{1024};
+            std::vector<Key> names, cids, raw_cids;
+            std::vector<u32> lids, tmp_lids, offsets, pos, ck_lids, ck_offsets, camps, raw_camps, hist;
+            std::vector<E> raw, tmp, evs, cks, ck_raw;
+            SessionState(const Window& w, u32 c, u32 k) : work(w, c, k) {}
+        };
+        std::vector<SessionState> sess;
+        sess.reserve(threads);
+        for (size_t t = 0; t < threads; ++t) sess.emplace_back(w, ncamp, ncat);
+        const i64 cws = w.click_start;
+        run_tasks(sess, person_buckets, [&](SessionState& st, size_t task) {
+            size_t p = order[task].second;
+            size_t n = 0;
+            for (auto& d : dedup) n += d.ev.size(p);
+            if (!n) return;
+            st.local.reset(n / 16 + 16);
+            st.names.clear();
+            st.offsets.assign(1, 0);
+            st.raw.resize(n);
+            st.lids.resize(n);
+            size_t k = 0;
+            u64 max_hi = 0;
+            for (auto& d : dedup) {
+                d.ev.for_each(p, [&](const PersonEvent<E>& e) {
+                    u32 lid = st.local.get_or_insert(e.person, [&] {
+                        st.names.push_back(e.person);
+                        st.offsets.push_back(0);
+                        return u32(st.names.size() - 1);
+                    });
+                    st.offsets[lid + 1] += 1;
+                    st.raw[k] = e.ev;
+                    st.lids[k++] = lid;
+                    max_hi = std::max(max_hi, P::hi(e.ev));
+                });
+            }
+            // the whole bucket in time order; the stable placement keeps it per person
+            radix_by_time<E>(st.raw, st.lids, st.tmp, st.tmp_lids, max_hi, st.hist);
+            const size_t people = st.names.size();
+            for (size_t i = 0; i < people; ++i) st.offsets[i + 1] += st.offsets[i];
+            st.evs.resize(n);
+            st.pos.assign(st.offsets.begin(), st.offsets.end() - 1);
+            for (k = 0; k < n; ++k) st.evs[st.pos[st.lids[k]]++] = st.raw[k];
+
+            // clicks of persons with events, likewise in time order
+            st.ck_raw.clear();
+            st.ck_lids.clear();
+            st.raw_cids.clear();
+            st.raw_camps.clear();
+            max_hi = 0;
+            for (auto& d : dedup) {
+                d.ck.for_each(p, [&](const PersonClick& c) {
+                    const u32* lid = st.local.find(c.person);
+                    if (!lid) return;
+                    u64 rel = u64(c.ts - cws);
+                    st.ck_raw.push_back(P::pair(rel, st.ck_raw.size()));
+                    st.ck_lids.push_back(*lid);
+                    st.raw_cids.push_back(c.cid);
+                    st.raw_camps.push_back(c.camp);
+                    max_hi = std::max(max_hi, rel);
+                });
+            }
+            radix_by_time<E>(st.ck_raw, st.ck_lids, st.tmp, st.tmp_lids, max_hi, st.hist);
+            const size_t m = st.ck_raw.size();
+            st.ck_offsets.assign(people + 1, 0);
+            for (u32 l : st.ck_lids) st.ck_offsets[l + 1] += 1;
+            for (size_t i = 0; i < people; ++i) st.ck_offsets[i + 1] += st.ck_offsets[i];
+            st.cks.resize(m);
+            st.cids.resize(m);
+            st.camps.resize(m);
+            st.pos.assign(st.ck_offsets.begin(), st.ck_offsets.end() - 1);
+            for (k = 0; k < m; ++k) {
+                u32 q = st.pos[st.ck_lids[k]]++;
+                size_t idx = P::lo(st.ck_raw[k]);
+                st.cks[q] = P::pair(P::hi(st.ck_raw[k]), q);
+                st.cids[q] = st.raw_cids[idx];
+                st.camps[q] = st.raw_camps[idx];
+            }
+            for (size_t l = 0; l < people; ++l) {
+                st.work.run(st.names[l], st.evs.data() + st.offsets[l], st.offsets[l + 1] - st.offsets[l],
+                            st.cks.data() + st.ck_offsets[l], st.ck_offsets[l + 1] - st.ck_offsets[l], st.cids.data(),
+                            st.camps.data());
+            }
+        });
+        timer.lap("sessions");
+
+        // ---- output
+        std::string ud_dir = out_dir + "/user_daily", cd_dir = out_dir + "/campaign_daily";
+        for (auto* dir : {&ud_dir, &cd_dir}) {
+            std::error_code ec;
+            std::filesystem::create_directories(*dir, ec);
+            for (auto it = std::filesystem::directory_iterator(*dir, ec); !ec && it != std::filesystem::directory_iterator();
+                 it.increment(ec))
+                if (it->path().extension() == ".parquet") std::filesystem::remove(it->path(), ec);
+        }
+        size_t total_rows = 0;
+        for (auto& s : sess) total_rows += s.work.rows.size();
+        std::vector<int> dummy(threads);
+        run_tasks(dummy, sess.size() + 1, [&](int&, size_t i) {
+            if (i == sess.size()) {
+                write_campaigns(sess, cd_dir);
+                return;
+            }
+            auto& rows = sess[i].work.rows;
+            if (rows.empty() && !(i == 0 && total_rows == 0)) return;
+            char name[48];
+            std::snprintf(name, sizeof name, "/part-%05zu.parquet", i);
+            write_users(rows, ud_dir + name);
+        });
+        timer.lap("output");
+    }
+
+    void write_users(const std::vector<UserRow>& rows, const std::string& path) {
+        using parquet::Column, parquet::Kind;
+        std::vector<Column> cols;
+        cols.push_back({"user_id", Kind::String, {}});
+        cols.push_back({"day", Kind::Date, {}});
+        cols.push_back({"sessions", Kind::Int64, {}});
+        cols.push_back({"events", Kind::Int64, {}});
+        cols.push_back({"revenue_cents", Kind::Int64, {}});
+        cols.push_back({"top_category", Kind::OptString, {}});
+        size_t n = rows.size();
+        cols[0].values.reserve(n * 14);
+        cols[1].values.reserve(n * 4);
+        for (int c = 2; c < 5; ++c) cols[c].values.reserve(n * 8);
+        cols[5].present.reserve(n);
+        for (auto& r : rows) {
+            cols[0].add_key(r.name);
+            cols[1].add_i32(r.day);
+            cols[2].add_i64(r.sessions);
+            cols[3].add_i64(r.events);
+            cols[4].add_i64(i64(r.revenue));
+            bool has = r.top != kNoCategory;
+            cols[5].present.push_back(has);
+            if (has) cols[5].add_string(catalog->categories[r.top]);
+        }
+        parquet::write_file(path, cols, n);
+    }
+
+    template <class S>
+    void write_campaigns(std::vector<S>& sess, const std::string& dir) {
+        using parquet::Column, parquet::Kind;
+        const u32 ncamp = u32(catalog->campaign_ids.size());
+        std::vector<std::array<u64, 4>> sum(size_t(ncamp + 1) * w.days);
+        for (auto& s : sess) {
+            auto& cells = s.work.cells.cells;
+            for (size_t i = 0; i < sum.size(); ++i)
+                for (int k = 0; k < 4; ++k) sum[i][k] += cells[i][k];
+        }
+        std::vector<Column> cols;
+        cols.push_back({"campaign_id", Kind::String, {}});
+        cols.push_back({"channel", Kind::String, {}});
+        cols.push_back({"day", Kind::Date, {}});
+        cols.push_back({"sessions", Kind::Int64, {}});
+        cols.push_back({"purchasing_sessions", Kind::Int64, {}});
+        cols.push_back({"revenue_cents", Kind::Int64, {}});
+        cols.push_back({"assisted_sessions", Kind::Int64, {}});
+        size_t rows = 0;
+        std::string id;
+        for (u32 c = 0; c <= ncamp; ++c) {
+            for (u32 d = 0; d < w.days; ++d) {
+                auto& v = sum[size_t(c) * w.days + d];
+                if (!v[0] && !v[3]) continue;
+                id.clear();
+                if (c == ncamp) {
+                    id = "organic";
+                    cols[1].add_string("organic");
+                } else {
+                    append_key(catalog->campaign_ids[c], id);
+                    cols[1].add_string(catalog->channels[c]);
+                }
+                cols[0].add_string(id);
+                cols[2].add_i32(i32(w.day0 + d));
+                for (int k = 0; k < 4; ++k) cols[3 + k].add_i64(i64(v[k]));
+                ++rows;
+            }
+        }
+        parquet::write_file(dir + "/part-00000.parquet", cols, rows);
+    }
+};
+
+}  // namespace
+}  // namespace ss
+
+int main(int argc, char** argv) {
+    const char* data = std::getenv("DATA_DIR");
+    const char* out = std::getenv("OUTPUT_DIR");
+    // the fixture runner also passes DATA_DIR and OUTPUT_DIR as the last two arguments
+    if (argc >= 3) data = argv[argc - 2], out = argv[argc - 1];
+    long threads = 0;
+    if (const char* n = std::getenv("NCPU")) threads = std::atol(n);
+    if (threads <= 0) threads = long(std::thread::hardware_concurrency());
+    threads = std::clamp<long>(threads, 1, 64);
+    ss::Pipeline p(data ? data : "/data", out ? out : "/output", size_t(threads),
+                   std::getenv("SHOPPING_PROFILE") != nullptr);
+    p.run();
+    std::fflush(stderr);
+    _exit(0);  // the kernel reclaims everything; skip destructors
 }

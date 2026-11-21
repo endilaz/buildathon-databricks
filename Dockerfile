@@ -1,18 +1,21 @@
-FROM python:3.11-slim-bookworm AS deps
+# A static binary on an empty image. x86 builds target AVX2 (x86-64-v3) tuned
+# for the scorer's Cascade Lake Xeons; arm64 builds (local testing) use the
+# build machine's CPU.
+FROM debian:bookworm-slim AS build
 RUN apt-get update && apt-get install -y --no-install-recommends g++ make && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir pyarrow==18.1.0
+WORKDIR /src
+COPY Makefile ./
+COPY src ./src
+RUN set -eux; \
+    case "$(uname -m)" in \
+      x86_64) arch="-march=x86-64-v3 -mtune=cascadelake" ;; \
+      *) arch="-mcpu=native" ;; \
+    esac; \
+    make CXX=g++ ARCHFLAGS="$arch" CXXFLAGS="-O3 -DNDEBUG -flto=auto -fno-plt" LDFLAGS="-static"; \
+    strip shopping-sessions
 
-FROM deps AS build
-WORKDIR /build
-COPY Makefile .
-COPY src src
-RUN make && mkdir /runtime && cp /usr/local/lib/python3.11/site-packages/pyarrow/libarrow.so.1801 /usr/local/lib/python3.11/site-packages/pyarrow/libparquet.so.1801 /runtime/
-
-FROM debian:bookworm-slim
-COPY --from=build /runtime/ /usr/local/lib/
-COPY --from=build /usr/local/lib/python3.11/site-packages/pyarrow-18.1.0.dist-info/LICENSE.txt /usr/share/doc/apache-arrow/LICENSE.txt
-COPY --from=build /usr/local/lib/python3.11/site-packages/pyarrow-18.1.0.dist-info/NOTICE.txt /usr/share/doc/apache-arrow/NOTICE.txt
-RUN ldconfig
-COPY --from=build /build/shopping-sessions /usr/local/bin/shopping-sessions
-USER 1000
-ENTRYPOINT ["/usr/local/bin/shopping-sessions"]
+FROM scratch
+COPY --from=build /src/shopping-sessions /shopping-sessions
+USER 1000:1000
+ENV DATA_DIR=/data OUTPUT_DIR=/output
+ENTRYPOINT ["/shopping-sessions"]

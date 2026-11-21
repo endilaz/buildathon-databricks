@@ -1,0 +1,214 @@
+// Minimal Parquet writer: one row group, one uncompressed PLAIN data page
+// (v1) per column, no statistics. Metadata in the Thrift compact protocol.
+#pragma once
+#include "base.hpp"
+#include <fcntl.h>
+
+namespace ss::parquet {
+
+enum class Kind { String, OptString, Date, Int64 };
+
+struct Column {
+    const char* name;
+    Kind kind;
+    std::string values;            // the PLAIN-encoded non-null values
+    std::vector<u8> present = {};  // OptString only: 1 per row when not null
+
+    void add_string(std::string_view s) {
+        u32 n = u32(s.size());
+        values.append(reinterpret_cast<const char*>(&n), 4);
+        values.append(s);
+    }
+    void add_key(Key k) {
+        if (is_long(k)) [[unlikely]] {
+            std::string s;
+            append_key(k, s);
+            add_string(s);
+            return;
+        }
+        u32 n = u32(u8(k));
+        char buf[20];
+        u64 hi = __builtin_bswap64(u64(k >> 64)), lo = __builtin_bswap64(u64(k));
+        std::memcpy(buf, &n, 4);
+        std::memcpy(buf + 4, &hi, 8);
+        std::memcpy(buf + 12, &lo, 8);
+        values.append(buf, 4 + n);
+    }
+    void add_i32(i32 v) { values.append(reinterpret_cast<const char*>(&v), 4); }
+    void add_i64(i64 v) { values.append(reinterpret_cast<const char*>(&v), 8); }
+};
+
+class Thrift {
+    std::vector<int16_t> last_{0};
+
+public:
+    std::string out;
+    void varint(u64 v) {
+        while (v >= 0x80) {
+            out.push_back(char(v | 0x80));
+            v >>= 7;
+        }
+        out.push_back(char(v));
+    }
+    void zigzag(i64 v) { varint((u64(v) << 1) ^ u64(v >> 63)); }
+    void field(int16_t id, u8 type) {
+        int16_t delta = int16_t(id - last_.back());
+        if (delta > 0 && delta <= 15) {
+            out.push_back(char((delta << 4) | type));
+        } else {
+            out.push_back(char(type));
+            zigzag(id);
+        }
+        last_.back() = id;
+    }
+    void i32_field(int16_t id, i64 v) { field(id, 5), zigzag(v); }
+    void i64_field(int16_t id, i64 v) { field(id, 6), zigzag(v); }
+    void string_field(int16_t id, std::string_view s) {
+        field(id, 8);
+        varint(s.size());
+        out.append(s);
+    }
+    void list_field(int16_t id, u8 elem, size_t n) {
+        field(id, 9);
+        if (n < 15) {
+            out.push_back(char((n << 4) | elem));
+        } else {
+            out.push_back(char(0xF0 | elem));
+            varint(n);
+        }
+    }
+    void begin_struct(int16_t id) { field(id, 12), last_.push_back(0); }
+    void begin_element() { last_.push_back(0); }
+    void end_struct() { out.push_back(0), last_.pop_back(); }
+    void stop() { out.push_back(0); }
+};
+
+constexpr u8 kI32 = 5, kBinary = 8, kStruct = 12;
+
+inline int physical(Kind k) { return k == Kind::Int64 ? 2 : k == Kind::Date ? 1 : 6; }
+
+inline std::string encode(std::vector<Column>& cols, size_t rows) {
+    std::string file = "PAR1";
+    struct Chunk {
+        i64 offset, size;
+    };
+    std::vector<Chunk> chunks;
+    if (rows) {
+        for (auto& c : cols) {
+            std::string body;
+            if (c.kind == Kind::OptString) {
+                // definition levels: one bit-packed run of width 1, length-prefixed
+                size_t groups = (rows + 7) / 8;
+                Thrift h;
+                h.varint((u64(groups) << 1) | 1);
+                std::string levels = h.out;
+                size_t base = levels.size();
+                levels.resize(base + groups, 0);
+                for (size_t i = 0; i < rows; ++i)
+                    if (c.present[i]) levels[base + i / 8] |= char(1 << (i % 8));
+                u32 n = u32(levels.size());
+                body.append(reinterpret_cast<const char*>(&n), 4);
+                body += levels;
+            }
+            body += c.values;
+            Thrift ph;
+            ph.i32_field(1, 0);  // DATA_PAGE
+            ph.i32_field(2, i64(body.size()));
+            ph.i32_field(3, i64(body.size()));
+            ph.begin_struct(5);
+            ph.i32_field(1, i64(rows));
+            ph.i32_field(2, 0);  // PLAIN
+            ph.i32_field(3, 3);  // RLE
+            ph.i32_field(4, 3);  // RLE
+            ph.end_struct();
+            ph.stop();
+            i64 offset = i64(file.size());
+            file += ph.out;
+            file += body;
+            chunks.push_back({offset, i64(file.size()) - offset});
+            std::string().swap(c.values);
+        }
+    }
+    Thrift t;
+    t.i32_field(1, 1);
+    t.list_field(2, kStruct, cols.size() + 1);
+    t.begin_element();
+    t.string_field(4, "schema");
+    t.i32_field(5, i64(cols.size()));
+    t.end_struct();
+    for (auto& c : cols) {
+        t.begin_element();
+        t.i32_field(1, physical(c.kind));
+        t.i32_field(3, c.kind == Kind::OptString ? 1 : 0);  // OPTIONAL : REQUIRED
+        t.string_field(4, c.name);
+        if (c.kind == Kind::String || c.kind == Kind::OptString) {
+            t.i32_field(6, 0);  // converted UTF8
+            t.begin_struct(10);
+            t.begin_struct(1);  // LogicalType.STRING
+            t.end_struct();
+            t.end_struct();
+        } else if (c.kind == Kind::Date) {
+            t.i32_field(6, 6);  // converted DATE
+            t.begin_struct(10);
+            t.begin_struct(6);  // LogicalType.DATE
+            t.end_struct();
+            t.end_struct();
+        }
+        t.end_struct();
+    }
+    t.i64_field(3, i64(rows));
+    if (rows) {
+        t.list_field(4, kStruct, 1);
+        t.begin_element();
+        t.list_field(1, kStruct, cols.size());
+        i64 total = 0;
+        for (size_t i = 0; i < cols.size(); ++i) {
+            auto& c = cols[i];
+            total += chunks[i].size;
+            t.begin_element();
+            t.i64_field(2, chunks[i].offset);
+            t.begin_struct(3);
+            t.i32_field(1, physical(c.kind));
+            t.list_field(2, kI32, 2);
+            t.zigzag(0);  // PLAIN
+            t.zigzag(3);  // RLE
+            t.list_field(3, kBinary, 1);
+            t.varint(std::strlen(c.name));
+            t.out += c.name;
+            t.i32_field(4, 0);  // UNCOMPRESSED
+            t.i64_field(5, i64(rows));
+            t.i64_field(6, chunks[i].size);
+            t.i64_field(7, chunks[i].size);
+            t.i64_field(9, chunks[i].offset);
+            t.end_struct();
+            t.end_struct();
+        }
+        t.i64_field(2, total);
+        t.i64_field(3, i64(rows));
+        t.end_struct();
+    } else {
+        t.list_field(4, kStruct, 0);
+    }
+    t.string_field(6, "shopping-sessions");
+    t.stop();
+    file += t.out;
+    u32 n = u32(t.out.size());
+    file.append(reinterpret_cast<const char*>(&n), 4);
+    file += "PAR1";
+    return file;
+}
+
+inline void write_file(const std::string& path, std::vector<Column>& cols, size_t rows) {
+    std::string bytes = encode(cols, rows);
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) die("cannot create %s", path.c_str());
+    size_t done = 0;
+    while (done < bytes.size()) {
+        ssize_t w = write(fd, bytes.data() + done, bytes.size() - done);
+        if (w <= 0) die("cannot write %s", path.c_str());
+        done += size_t(w);
+    }
+    close(fd);
+}
+
+}  // namespace ss::parquet

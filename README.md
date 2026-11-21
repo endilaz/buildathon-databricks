@@ -1,50 +1,40 @@
 # Databricks Shopping Sessions
 
-This C++17 pipeline turns raw clickstream CSVs into the two exact daily Parquet tables for the Databricks buildathon track. It reads the event window from the manifest and runs up to eight workers. The competition times the container from process start through output completion. [Track overview](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions) · [Data specification](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md?inline=1)
+This C++20 pipeline turns raw clickstream CSVs into the two exact daily Parquet tables for the Databricks buildathon track. It is a single static binary on an empty image, with no runtime dependencies. All of its code was written for this event. [Track overview](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions) · [Data specification](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md?inline=1)
 
 ## Run the scored entry point
 
-Build the image at the repository root. Set `DATA` to an absolute path containing a generated dataset. Set `OUT` to a dedicated output directory writable by UID 1000.
-
 ```sh
 docker build --platform linux/amd64 -t shopping-sessions .
-mkdir -p "$OUT"
 docker run --rm --platform linux/amd64 --network none --read-only --user 1000 \
   --cpus 8 -e NCPU=8 -v "$DATA:/data:ro" -v "$OUT:/output" shopping-sessions
 ```
 
-The image writes `user_daily/*.parquet` and `campaign_daily/*.parquet`. The pipeline keeps its working data in memory. Set `SHOPPING_PROFILE=1` to print stage timings to stderr.
+It reads `DATA_DIR` and `OUTPUT_DIR` (default `/data` and `/output`), or the last two arguments. Set `SHOPPING_PROFILE=1` to print stage timings to stderr.
 
-## Implementation
+## How it works
 
-1. Read all identity links and join their connected components with union-find. Keep the bytewise smallest original identifier in each component, including link-only IDs. Short identifiers can use an exact packed key. Arbitrary identifiers use a full-string dictionary.
-2. Memory-map the CSV files and distribute newline-aligned chunks across workers. A compact bit filter finds event IDs that may repeat. Every candidate goes through exact ID and ingest-time comparisons. An invalid earliest copy suppresses later copies. A collision in the filter only adds work.
-3. Assign surviving events and eligible ad clicks to 64 partitions by resolved person. Sort each partition by person and time. A gap strictly greater than 30 minutes starts a session. The UTC start day owns the whole session.
-4. For each shopper, move two pointers across the inclusive seven-day click window. The winning click is the latest, with ties settled by the smallest click ID. Per-campaign counts track which campaigns assisted. Identical duplicate clicks leave both the winner and the set of assisting campaigns unchanged.
-5. Write each partition's user rows directly to Parquet and merge campaign totals across partitions. The pipeline writes each file under a temporary name and renames it after the Parquet footer closes.
+IDs never live in memory as strings. An ID of up to 15 bytes is packed into a 128-bit integer: its bytes from the top, then its length in the lowest byte. Integer equality is string equality, and integer order is byte-wise string order, which the "smallest ID" and "smallest click_id" rules need. Longer IDs are interned and keep exact semantics. A person is represented by the key of its smallest ID, so no step ever builds a global name dictionary.
 
-DuckDB SQL and Polars are both viable ways to express the transformations. The native implementation gives direct control over the CSV dialect, global deduplication and the cost of attribution for high-activity shoppers. Its external runtime dependencies are Apache Arrow and Parquet C++ 18.1.0, supplied by the PyArrow wheel. The pipeline code was written for this event. The official generator, fixtures and expected answers are separate test inputs.
+1. **Links.** Link files are split in parallel. Union-find over the packed keys runs on a helper thread during the event parse. It maps each linked ID to its person's name, and an unlinked ID names itself.
+2. **Parse.** Each worker reads 4 MB chunks of the memory-mapped inputs. Fields are found from 64-byte separator and quote bitmasks (AVX2 or NEON). Timestamps are validated and converted with 8-byte loads and a month table. Every event line with a non-empty `event_id` becomes a fixed-size record, marked invalid if it fails validation, so an invalid earliest copy still wins dedup. Records are scattered into blocks by `event_id` hash; nothing is reallocated or copied.
+3. **Dedup.** Each `event_id` bucket is deduplicated in a small open-addressing table, where the earliest `ingest_ts` wins. Valid survivors are read back in memory order, resolved to their person with prefetched lookups, and scattered by person hash together with the valid clicks. A finished bucket's memory takes the next writes.
+4. **Sessions.** Each person bucket (about 16k events) is radix-sorted by time once and then grouped stably by person, so every person's events and clicks arrive already in time order. Sessions split on gaps of more than 30 minutes, and belong to their start's UTC day. The credited click is the latest one in the inclusive 7-day window, with ties going to the smallest `click_id`. Assists come straight from each session's click window. For very active persons they come instead from merged per-campaign `[click, click + 7 days]` intervals. Campaign totals go into a dense campaign-by-day array.
+5. **Output.** A minimal Parquet writer emits one uncompressed PLAIN page per column: one `user_daily` file per worker, and one `campaign_daily` file. The process exits without freeing anything, and a helper thread unmaps the inputs.
 
 ## Reproduce the checks
 
-The track provides the starter's `scripts/` and `fixtures/`, the dataset generator, and the `dev-answer/` reference tables. Keep these downloads outside the source tree. The native build uses the C++ headers and libraries in the pinned PyArrow wheel. A Python 3.10+ environment with Polars runs the organizers' checkers.
+The track provides the starter's `scripts/` and `fixtures/`, the dataset generator, and the `dev-answer/` reference tables. Keep these downloads outside the source tree. Python with Polars runs the organizers' checkers.
 
 ```sh
-python3 -m pip install pyarrow==18.1.0 polars
-make
-python3 "$STARTER/scripts/run_fixtures.py" "$STARTER/fixtures" -- "$PWD/shopping-sessions"
-
-generate --seed 1 --events 1000000 --clicks 250000 --output "$DATA"
-DATA_DIR="$DATA" OUTPUT_DIR="$OUT" NCPU=8 ./shopping-sessions
-python3 "$STARTER/scripts/compare.py" "$OUT" "$DEV_ANSWER"
+make && make test   # native build; fuzzes the fast parsing paths against scalar references
+PY=python3 STARTER=path/to/starter BENCH=path/to/datasets scripts/check.sh   # fixtures, dev answer
 ```
 
-For a practice-sized timing, generate a new dataset with 20,000,000 events and 5,000,000 clicks in a fresh directory. Time the process separately from the generator. An Apple Silicon native binary and a Linux amd64 container running under emulation have different timings from the competition's native Intel machines.
+`scripts/vm_bench.sh` gives interleaved timings of Linux builds inside the Docker VM, and `scripts/ab_stats.py` summarises them as medians.
 
 ## Measured results
 
-On the development Mac, the native executable passed all 36 official fixtures. The official seed-1 comparison matched all 117,038 user-day rows and all 27,400 campaign-day rows, with zero duplicate keys.
+The pipeline passes all 36 official fixtures. It matches the official seed-1 answer exactly, both natively and as the amd64 image. On seven more generated seeds, with 1M to 8M events, its output matches an independent pipeline row for row.
 
-With eight workers, three consecutive native runs on seed 21 (20 million events and 5 million clicks) took 4.03, 3.01 and 2.86 seconds. The median was 3.01 seconds and the highest observed process RSS was 3.78 GiB. The CSV input occupied 1.8 GiB and the Parquet output occupied 92 MiB. These machine-local measurements include process startup and writing both output tables. The generator ran before the benchmark.
-
-The same practice dataset took 6.42 seconds inside the Linux amd64 image under Docker Desktop emulation. The cgroup reported a peak of 3.24 GiB with a 6 GiB cap and swap disabled. Its output matched the native run on all 2,219,052 user-day rows and 28,014 campaign-day rows.
+On the 20M-event practice dataset, Linux arm64 in Docker on an Apple M5 with 8 CPUs, the median run takes 0.93 to 0.96 s from process start to the last output file. The previous version of this repository took 3.7 s natively on the same data. Peak RSS is about 3.5 GB, half of it the mapped input. Scorer timings on Intel Xeons differ from these.
