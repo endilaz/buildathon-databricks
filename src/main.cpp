@@ -603,8 +603,11 @@ struct Pipeline {
             u64 max_hi = 0;
             for (auto& d : dedup) {
                 d.ev.for_each(p, [&](const PersonEvent<E>& e) {
-                    u32 lid = st.local.get_or_insert(e.person, [&] {
-                        st.names.push_back(e.person);
+                    // records are packed to 8 bytes: copy keys out before taking
+                    // references (a Key& assumes 16-byte alignment)
+                    const Key person = e.person;
+                    u32 lid = st.local.get_or_insert(person, [&] {
+                        st.names.push_back(person);
                         st.offsets.push_back(0);
                         return u32(st.names.size() - 1);
                     });
@@ -635,7 +638,8 @@ struct Pipeline {
                     u64 rel = c.rel;
                     st.ck_raw.push_back(P::pair(rel, st.ck_raw.size()));
                     st.ck_lids.push_back(*lid);
-                    st.raw_cids.push_back(c.cid);
+                    const Key cid = c.cid;  // packed member: copy before binding a reference
+                    st.raw_cids.push_back(cid);
                     st.raw_camps.push_back(c.camp);
                     max_hi = std::max(max_hi, rel);
                 });

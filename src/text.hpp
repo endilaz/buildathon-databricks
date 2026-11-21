@@ -103,8 +103,8 @@ public:
             const char* a = d_ + p;
             size_t n = q - p;
             // branch-free: fields are quoted at random, so a branch here mispredicts
-            // (a[n - 1] for n == 0 reads the previous separator, which is in bounds)
-            u32 quoted = u32(n >= 2) & u32(a[0] == '"') & u32(a[n - 1] == '"');
+            // (for n == 0 the last byte read is the field's own separator)
+            u32 quoted = u32(n >= 2) & u32(a[0] == '"') & u32(a[n - (n != 0)] == '"');
             expect += 2 * quoted;
             if (k < N) f[k] = Field(a + quoted, n - 2 * size_t(quoted));
             if ((nl_ >> bit) & 1) {

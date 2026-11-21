@@ -5,3 +5,4 @@
 /scratch/
 .DS_Store
 /tests/parse_test
+/shopping-sessions-ubsan
