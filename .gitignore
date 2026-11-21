@@ -1,0 +1,6 @@
+/shopping-sessions
+/.venv/
+/data/
+/output/
+/scratch/
+.DS_Store
