@@ -11,6 +11,7 @@
 #include "table.hpp"
 #include <map>
 #include <type_traits>
+#include <sched.h>
 #include <sys/resource.h>
 
 namespace ss {
@@ -695,7 +696,7 @@ struct Pipeline {
         if (timer.on) {
             struct rusage u{};
             getrusage(RUSAGE_SELF, &u);
-            std::fprintf(stderr, "[%8s] faults=%ld maxrss=%ldMB\n", "", u.ru_minflt, u.ru_maxrss / 1024);
+            std::fprintf(stderr, "[%8s] faults=%ld maxrss=%ldMB threads=%zu\n", "", u.ru_minflt, u.ru_maxrss / 1024, threads);
         }
     }
 
@@ -785,14 +786,47 @@ void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, size_t) noexcept { std::free(p); }
 void operator delete[](void* p, size_t) noexcept { std::free(p); }
 
+// CPUs this process may use: the hardware count, limited by the affinity
+// mask and a cgroup CPU quota (hardware_concurrency() sees neither, so a
+// container capped at 8 CPUs on a large host would oversubscribe badly).
+static long available_cpus() {
+    long n = long(std::thread::hardware_concurrency());
+    if (n <= 0) n = 8;
+#ifdef __linux__
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof set, &set) == 0) n = std::min<long>(n, CPU_COUNT(&set));
+    auto quota = [&](long q, long period) {
+        if (q > 0 && period > 0) n = std::min(n, std::max(1L, (q + period - 1) / period));
+    };
+    if (FILE* f = std::fopen("/sys/fs/cgroup/cpu.max", "r")) {  // cgroup v2: "<quota|max> <period>"
+        char q[32] = {};
+        long period = 0;
+        if (std::fscanf(f, "%31s %ld", q, &period) == 2 && std::strcmp(q, "max") != 0) quota(std::atol(q), period);
+        std::fclose(f);
+    } else if (FILE* fq = std::fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r")) {  // cgroup v1
+        long q = -1, period = 0;
+        if (std::fscanf(fq, "%ld", &q) != 1) q = -1;
+        std::fclose(fq);
+        if (FILE* fp = std::fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r")) {
+            if (std::fscanf(fp, "%ld", &period) != 1) period = 0;
+            std::fclose(fp);
+        }
+        quota(q, period);
+    }
+#endif
+    return std::max(1L, n);
+}
+
 int main(int argc, char** argv) {
     const char* data = std::getenv("DATA_DIR");
     const char* out = std::getenv("OUTPUT_DIR");
     // the fixture runner also passes DATA_DIR and OUTPUT_DIR as the last two arguments
     if (argc >= 3) data = argv[argc - 2], out = argv[argc - 1];
+    // NCPU, capped by what the container may actually run at once
     long threads = 0;
     if (const char* n = std::getenv("NCPU")) threads = std::atol(n);
-    if (threads <= 0) threads = long(std::thread::hardware_concurrency());
+    long usable = available_cpus();
+    threads = threads > 0 ? std::min(threads, usable) : usable;
     threads = std::clamp<long>(threads, 1, 64);
     ss::Pipeline p(data ? data : "/data", out ? out : "/output", size_t(threads),
                    std::getenv("SHOPPING_PROFILE") != nullptr);
