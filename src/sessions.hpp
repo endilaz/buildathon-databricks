@@ -35,11 +35,17 @@ struct Pack<u128> {
     static u64 lo(u128 e) { return u64(e); }
 };
 
-// Stable LSD radix sort of the pairs (a[i], b[i]) by Pack<E>::hi(a[i]),
-// 11 bits a pass; max_hi bounds the keys.
+// Time is sorted at this granularity (2^kCoarse ms) by the bucket radix
+// sort; each person's array is then finished by an insertion pass, which is
+// nearly free on nearly sorted input.
+constexpr int kCoarse = 10;
+
+// Stable LSD radix sort of the pairs (a[i], b[i]) by Pack<E>::hi(a[i]) >> kCoarse,
+// 11 bits a pass; max_hi bounds hi.
 template <class E, class B>
 void radix_by_time(std::vector<E>& a, std::vector<B>& b, std::vector<E>& ta, std::vector<B>& tb, u64 max_hi,
                    std::vector<u32>& hist) {
+    max_hi >>= kCoarse;
     using P = Pack<E>;
     const size_t n = a.size();
     if (n < 2 || max_hi == 0) return;
@@ -49,7 +55,7 @@ void radix_by_time(std::vector<E>& a, std::vector<B>& b, std::vector<E>& ta, std
     const int bits = 64 - __builtin_clzll(max_hi);
     for (int shift = 0; shift < bits; shift += 11) {
         std::fill(hist.begin(), hist.end(), 0);
-        for (size_t i = 0; i < n; ++i) ++hist[(P::hi(a[i]) >> shift) & 2047];
+        for (size_t i = 0; i < n; ++i) ++hist[(P::hi(a[i]) >> (shift + kCoarse)) & 2047];
         u32 sum = 0;
         bool one_digit = false;
         for (auto& h : hist) {
@@ -60,12 +66,27 @@ void radix_by_time(std::vector<E>& a, std::vector<B>& b, std::vector<E>& ta, std
         }
         if (one_digit) continue;
         for (size_t i = 0; i < n; ++i) {
-            u32 q = hist[(P::hi(a[i]) >> shift) & 2047]++;
+            u32 q = hist[(P::hi(a[i]) >> (shift + kCoarse)) & 2047]++;
             ta[q] = a[i];
             tb[q] = b[i];
         }
         a.swap(ta);
         b.swap(tb);
+    }
+}
+
+// Finishes a nearly sorted array.
+template <class T>
+inline void insertion_finish(T* a, size_t n) {
+    for (size_t i = 1; i < n; ++i) {
+        if (!(a[i] < a[i - 1])) [[likely]] continue;
+        T x = a[i];
+        size_t j = i;
+        do {
+            a[j] = a[j - 1];
+            --j;
+        } while (j > 0 && x < a[j - 1]);
+        a[j] = x;
     }
 }
 
@@ -129,10 +150,14 @@ public:
         c[2] += s.revenue;
     }
 
-    // ev: the person's events in time order; ck: click keys pair(ts -
-    // click_start, pos) in ascending order, with cid[pos] and camp[pos] the
-    // rest of each click.
-    void run(Key name, const E* ev, size_t n, const E* ck, size_t m, const Key* cid, const u32* camp) {
+    // ev: the person's events, in time order at kCoarse granularity; ck:
+    // click keys pair(ts - click_start, pos), likewise, with cid[pos] and
+    // camp[pos] the rest of each click. Both are finished here.
+    void run(Key name, E* ev, size_t n, E* ck, size_t m, const Key* cid, const u32* camp) {
+        if (kCoarse) {
+            insertion_finish(ev, n);
+            insertion_finish(ck, m);
+        }
         sessions_.clear();
         const u64 offset = u64(w_.start - w_.click_start);
         for (size_t i = 0; i < n;) {
