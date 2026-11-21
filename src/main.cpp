@@ -478,7 +478,14 @@ struct Pipeline {
         };
         std::vector<SessionState> sess;
         sess.reserve(threads);
-        for (size_t t = 0; t < threads; ++t) sess.emplace_back(w, ncamp, ncat);
+        size_t kept = 0;
+        for (auto& d : dedup)
+            for (size_t p = 0; p < person_buckets; ++p) kept += d.ev.size(p);
+        for (size_t t = 0; t < threads; ++t) {
+            sess.emplace_back(w, ncamp, ncat);
+            // about one user-day row per 8 kept events: reserve (untouched) room for 2x that
+            sess.back().work.rows.reserve(kept / threads / 4 + 1024);
+        }
         const i64 cws = w.click_start;
         run_tasks(sess, person_buckets, [&](SessionState& st, size_t task) {
             size_t p = order[task].second;
