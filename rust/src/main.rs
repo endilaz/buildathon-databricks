@@ -27,11 +27,11 @@ use text::*;
 #[global_allocator]
 static GLOBAL: Alloc = Alloc;
 
-// event_id buckets: about this many lines each, so a bucket's dedup table
-// (2 slots of 8 bytes per line) fits a 1 MB L2
-#[cfg(not(feature = "bigdd"))]
+// event_id buckets: about this many lines each (smalldd, half as many so a
+// table fits a 1 MB L2, was slightly slower on the x86 bench)
+#[cfg(feature = "smalldd")]
 const EVENT_BUCKET_LINES: usize = 32768;
-#[cfg(feature = "bigdd")]
+#[cfg(not(feature = "smalldd"))]
 const EVENT_BUCKET_LINES: usize = 65536;
 const PERSON_BUCKET_EVENTS: usize = 32768; // person buckets: few enough that staging groups stay in L2
 
@@ -242,11 +242,6 @@ impl Persons {
         let i = (h >> FILTER_SHIFT) as usize & self.filter_mask;
         let flagged = (unsafe { *self.filter.get_unchecked(i >> 6) } >> (i & 63)) & 1;
         let real = unsafe { self.slots.as_ptr().add(region_slot(self.region_bits, h)) } as usize;
-        #[cfg(feature = "nofilter")]
-        return {
-            let _ = flagged;
-            real as *const KeySlot<Key>
-        };
         let empty = &EMPTY_SLOT as *const KeySlot<Key> as usize;
         (empty ^ ((real ^ empty) & (flagged as usize).wrapping_neg())) as *const KeySlot<Key>
     }
@@ -261,6 +256,8 @@ impl Persons {
         let linked = s.k == user;
         (if linked { s.v } else { user }, linked)
     }
+    // (the probe's lookups, without the filter)
+    #[cfg_attr(not(feature = "probe"), allow(dead_code))]
     // Linked or not is a coin toss from line to line: the first slot's answer
     // is selected, not branched on; only a collision walks on. Also says
     // whether user is linked (so its bytes were recorded with the links).
@@ -287,6 +284,7 @@ impl Persons {
             i = region_next(self.region_bits, i);
         }
     }
+    #[cfg_attr(not(feature = "probe"), allow(dead_code))]
     #[inline(always)]
     fn prefetch_hashed(&self, h: u64) {
         prefetch(unsafe { self.slots.as_ptr().add(region_slot(self.region_bits, h)) });
@@ -524,10 +522,10 @@ fn restart(var: &str, val: &str) -> ! {
 // Person lookups during the parse run this many lines after their prefetch,
 // so each (DRAM) miss overlaps the parsing of the lines between.
 const READ_PIECE: usize = 256 << 10;
-#[cfg(not(feature = "pd8"))]
+#[cfg(not(feature = "pd16"))]
 const PARSE_DELAY: usize = 12;
-#[cfg(feature = "pd8")]
-const PARSE_DELAY: usize = 8;
+#[cfg(feature = "pd16")]
+const PARSE_DELAY: usize = 16;
 
 // A long ID read at parse time, recorded (base.rs) when its line is flushed,
 // by then with its table slot prefetched. The bytes are still in the piece
@@ -1170,7 +1168,7 @@ impl Pipeline {
             }
             let cap = pow2_at_least(2 * n);
             let mask = cap - 1;
-            if st.table.len() != cap || st.generation == 255 {
+            if st.table.len() != cap || st.generation == 255 || cfg!(feature = "ddclear") {
                 st.table.clear();
                 st.table.resize(cap, 0);
                 st.generation = 1;
@@ -1262,7 +1260,20 @@ impl Pipeline {
                 }
             })
             .collect();
+        #[cfg(feature = "probe")]
+        let stage_ns: [std::sync::atomic::AtomicU64; 6] = Default::default();
+        #[cfg(feature = "probe")]
+        let lap = {
+            let stage_ns = &stage_ns;
+            move |t: &mut Instant, k: usize| {
+                let now = Instant::now();
+                stage_ns[k].fetch_add((now - *t).as_nanos() as u64, Relaxed);
+                *t = now;
+            }
+        };
         run_tasks(&mut sess, person_buckets, |st, task| {
+            #[cfg(feature = "probe")]
+            let mut t = Instant::now();
             let p = order[task].1 as usize;
             let n: usize = parsed.iter().map(|d| d.ev.size(p)).sum();
             if n == 0 {
@@ -1307,6 +1318,8 @@ impl Pipeline {
             if n == 0 {
                 return;
             }
+            #[cfg(feature = "probe")]
+            lap(&mut t, 0); // gather events into the person map
             // the whole bucket in time order; the stable placement keeps it per person
             radix_by_time(&mut st.raw, &mut st.lids, &mut st.tmp, &mut st.tmp_lids, max_hi, &mut st.hist);
             let people = st.names.len();
@@ -1325,6 +1338,8 @@ impl Pipeline {
                 }
             }
 
+            #[cfg(feature = "probe")]
+            lap(&mut t, 1); // radix sort and place events
             // clicks of persons with events, likewise in time order; the
             // buffers are sized for every click of the bucket, then cut
             let mc: usize = parsed.iter().map(|d| d.ck.size(p)).sum();
@@ -1350,6 +1365,8 @@ impl Pipeline {
             }
             st.ck_raw.truncate(m);
             st.ck_lids.truncate(m);
+            #[cfg(feature = "probe")]
+            lap(&mut t, 2); // gather clicks
             radix_by_time(&mut st.ck_raw, &mut st.ck_lids, &mut st.tmp, &mut st.tmp_lids, max_hi, &mut st.hist);
             st.ck_offsets.clear();
             st.ck_offsets.resize(people + 1, 0);
@@ -1377,12 +1394,23 @@ impl Pipeline {
                     *st.camps.get_unchecked_mut(q) = *st.raw_camps.get_unchecked(idx);
                 }
             }
+            #[cfg(feature = "probe")]
+            lap(&mut t, 3); // radix sort and place clicks
             for l in 0..people {
                 let (e0, e1) = (st.offsets[l] as usize, st.offsets[l + 1] as usize);
                 let (c0, c1) = (st.ck_offsets[l] as usize, st.ck_offsets[l + 1] as usize);
                 st.work.run(st.names[l], &mut st.evs[e0..e1], &mut st.cks[c0..c1], &st.cids, &st.camps);
             }
+            #[cfg(feature = "probe")]
+            lap(&mut t, 4); // per-person work
         });
+        #[cfg(feature = "probe")]
+        {
+            let names = ["gather events", "sort+place events", "gather clicks", "sort+place clicks", "per-person work", ""];
+            for (k, name) in names.iter().enumerate().take(5) {
+                eprintln!("[{:>8}] sessions {:<18} {:7.1} ms (all threads)", "", name, stage_ns[k].load(Relaxed) as f64 / 1e6);
+            }
+        }
         self.timer.lap("sessions");
 
         // ---- output

@@ -103,7 +103,8 @@ impl Ev for u128 {
 pub const COARSE: u32 = 10;
 
 // Stable LSD radix sort of the pairs (a[i], b[i]) by a[i].hi() >> COARSE,
-// 11 bits a pass; max_hi bounds hi.
+// 11 bits a pass; max_hi bounds hi. (One pass at 2^20 ms was tried: the
+// insertion pass then costs far more on the big merged persons.)
 pub fn radix_by_time<E: Ev, B: Copy>(
     a: &mut Vec<E>,
     b: &mut Vec<B>,
@@ -112,7 +113,8 @@ pub fn radix_by_time<E: Ev, B: Copy>(
     max_hi: u64,
     hist: &mut Vec<u32>,
 ) {
-    let max_hi = max_hi >> COARSE;
+    let coarse = COARSE;
+    let max_hi = max_hi >> coarse;
     let n = a.len();
     if n < 2 || max_hi == 0 {
         return;
@@ -129,7 +131,7 @@ pub fn radix_by_time<E: Ev, B: Copy>(
     while shift < bits {
         hist.fill(0);
         for x in a.iter() {
-            hist[((x.hi() >> (shift + COARSE)) & 2047) as usize] += 1;
+            hist[((x.hi() >> (shift + coarse)) & 2047) as usize] += 1;
         }
         let mut sum = 0u32;
         let mut one_digit = false;
@@ -142,7 +144,7 @@ pub fn radix_by_time<E: Ev, B: Copy>(
         if !one_digit {
             for i in 0..n {
                 let x = unsafe { *a.get_unchecked(i) };
-                let slot = unsafe { hist.get_unchecked_mut(((x.hi() >> (shift + COARSE)) & 2047) as usize) };
+                let slot = unsafe { hist.get_unchecked_mut(((x.hi() >> (shift + coarse)) & 2047) as usize) };
                 let q = *slot as usize;
                 *slot += 1;
                 unsafe {

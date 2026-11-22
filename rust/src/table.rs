@@ -1,6 +1,6 @@
 // Linear-probing map from Key (never 0) to a small value, key and value in
 // one slot so a hit touches one cache line.
-use crate::base::*;
+use crate::base::Key;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -9,9 +9,12 @@ pub struct KeySlot<V: Copy> {
     pub v: V,
 }
 
+// Slots are picked by Fibonacci hashing (one multiply, high bits), which
+// spreads these keys well and is half the latency of key_hash.
 pub struct KeyMap<V: Copy> {
     slots: Vec<KeySlot<V>>,
     mask: usize,
+    shift: u32,
     size: usize,
 }
 
@@ -25,7 +28,7 @@ fn capacity_for(n: usize) -> usize {
 
 impl<V: Copy> KeyMap<V> {
     pub fn new(n: usize) -> Self {
-        let mut m = KeyMap { slots: Vec::new(), mask: 0, size: 0 };
+        let mut m = KeyMap { slots: Vec::new(), mask: 0, shift: 0, size: 0 };
         m.reset(n);
         m
     }
@@ -46,12 +49,21 @@ impl<V: Copy> KeyMap<V> {
             self.slots = Self::zeroed(cap);
         }
         self.mask = cap - 1;
+        self.shift = 64 - cap.trailing_zeros();
         self.size = 0;
+    }
+    #[inline(always)]
+    fn home(&self, k: Key) -> usize {
+        #[cfg(feature = "mixhash")]
+        return crate::base::key_hash(k) as usize & self.mask;
+        #[cfg(not(feature = "mixhash"))]
+        return (k.wrapping_mul(0x9E3779B97F4A7C15) >> self.shift) as usize;
     }
     fn grow(&mut self) {
         let cap = capacity_for(self.slots.len());
         let old = std::mem::replace(&mut self.slots, Self::zeroed(cap));
         self.mask = self.slots.len() - 1;
+        self.shift = 64 - self.slots.len().trailing_zeros();
         self.size = 0;
         for s in old {
             if s.k != 0 {
@@ -61,7 +73,7 @@ impl<V: Copy> KeyMap<V> {
     }
     #[inline(always)]
     pub fn find(&self, k: Key) -> Option<V> {
-        let mut i = key_hash(k) as usize & self.mask;
+        let mut i = self.home(k);
         loop {
             let s = unsafe { self.slots.get_unchecked(i) };
             if s.k == k {
@@ -79,7 +91,7 @@ impl<V: Copy> KeyMap<V> {
         if (self.size + 1) * 4 > self.slots.len() * 3 {
             self.grow();
         }
-        let mut i = key_hash(k) as usize & self.mask;
+        let mut i = self.home(k);
         loop {
             let s = unsafe { self.slots.get_unchecked_mut(i) };
             if s.k == k {
@@ -98,7 +110,7 @@ impl<V: Copy> KeyMap<V> {
         if (self.size + 1) * 4 > self.slots.len() * 3 {
             self.grow();
         }
-        let mut i = key_hash(k) as usize & self.mask;
+        let mut i = self.home(k);
         loop {
             let s = &mut self.slots[i];
             if s.k == k || s.k == 0 {
