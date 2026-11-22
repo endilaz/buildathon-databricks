@@ -245,7 +245,7 @@ impl Persons {
     // chosen LOOKUP_STAGE lines later).
     #[inline(always)]
     fn first_stage(&self, h: u64) -> *const KeySlot<Key> {
-        if cfg!(feature = "stage2") {
+        if !cfg!(feature = "stage1") {
             let i = (h >> FILTER_SHIFT) as usize & self.filter_mask;
             prefetch(unsafe { self.filter.as_ptr().add(i >> 6) });
             std::ptr::null()
@@ -262,6 +262,11 @@ impl Persons {
         let i = (h >> FILTER_SHIFT) as usize & self.filter_mask;
         let flagged = (unsafe { *self.filter.get_unchecked(i >> 6) } >> (i & 63)) & 1;
         let real = unsafe { self.slots.as_ptr().add(region_slot(self.region_bits, h)) } as usize;
+        #[cfg(feature = "nofilter")]
+        return {
+            let _ = flagged;
+            real as *const KeySlot<Key>
+        };
         let empty = &EMPTY_SLOT as *const KeySlot<Key> as usize;
         (empty ^ ((real ^ empty) & (flagged as usize).wrapping_neg())) as *const KeySlot<Key>
     }
@@ -541,11 +546,12 @@ fn restart(var: &str, val: &str) -> ! {
 // ---------------------------------------------------------------- parse
 
 // Person lookups during the parse run this many lines after their prefetch,
-// so each (DRAM) miss overlaps the parsing of the lines between. Feature
-// stage2 does it in two stages: a line's filter word is prefetched when it
-// is parsed, and LOOKUP_STAGE lines later (the word now cached) its slot is
-// chosen and prefetched (for caches too small for the filter: slower on the
-// M5, where it fits).
+// so each (DRAM) miss overlaps the parsing of the lines between. In two
+// stages: a line's filter word is prefetched when it is parsed, and
+// LOOKUP_STAGE lines later (the word now cached) its slot is chosen and
+// prefetched. The filter word missed L2 on the x86 bench (20% of the event
+// path waited on it); feature stage1 chooses the slot at once (faster on
+// the M5, whose L2 holds the filter).
 // pread pieces (SHOPPING_PIECE overrides, for sweeps)
 const READ_PIECE: usize = 256 << 10;
 #[cfg(not(feature = "pd16"))]
@@ -740,7 +746,7 @@ impl Ctx<'_> {
                         if st.nev >= PARSE_DELAY {
                             self.flush_event(st, i);
                         }
-                        if cfg!(feature = "stage2") && st.nev >= LOOKUP_STAGE {
+                        if !cfg!(feature = "stage1") && st.nev >= LOOKUP_STAGE {
                             let j = (st.nev - LOOKUP_STAGE) % PARSE_DELAY;
                             let slot = self.persons.lookup_slot(st.pending_ev[j].h);
                             prefetch(slot);
@@ -798,7 +804,7 @@ impl Ctx<'_> {
         if st.nck >= PARSE_DELAY {
             self.flush_click(st, i);
         }
-        if cfg!(feature = "stage2") && st.nck >= LOOKUP_STAGE {
+        if !cfg!(feature = "stage1") && st.nck >= LOOKUP_STAGE {
             let j = (st.nck - LOOKUP_STAGE) % PARSE_DELAY;
             let slot = self.persons.lookup_slot(st.pending_ck_h[j]);
             prefetch(slot);
@@ -941,11 +947,9 @@ struct Pipeline {
 }
 
 struct DedupState {
-    // entries: tag (24 hash bits) << 40 | generation << 32 | record + 1. An
-    // entry of another generation (an earlier bucket) reads as empty, so the
-    // table is cleared only when its size changes or 255 buckets have used it.
+    // entries: tag (32 hash bits) << 32 | record + 1; cleared per bucket (a
+    // generation stamp instead was 27 ms slower on the Intel bench)
     table: Vec<u64>,
-    generation: u64,
     blocks: Vec<*const DedupRec>,
     lens: Vec<u32>,
 }
@@ -1193,7 +1197,7 @@ impl Pipeline {
         // ---- dedup: per event_id bucket the earliest copy wins; every other
         // copy's filed event (if it has one) is dropped where it lies
         let mut dedup: Vec<DedupState> =
-            (0..threads).map(|_| DedupState { table: Vec::new(), generation: 0, blocks: Vec::new(), lens: Vec::new() }).collect();
+            (0..threads).map(|_| DedupState { table: Vec::new(), blocks: Vec::new(), lens: Vec::new() }).collect();
         run_tasks(&mut dedup, event_buckets, |st, b| {
             st.blocks.clear();
             st.lens.clear();
@@ -1211,15 +1215,8 @@ impl Pipeline {
             }
             let cap = pow2_at_least(2 * n);
             let mask = cap - 1;
-            if st.table.len() != cap || st.generation == 255 || cfg!(feature = "ddclear") {
-                st.table.clear();
-                st.table.resize(cap, 0);
-                st.generation = 1;
-            } else {
-                st.generation += 1;
-            }
-            const GEN: u64 = 0xFF << 32;
-            let generation = st.generation << 32;
+            st.table.clear();
+            st.table.resize(cap, 0);
             let blocks = &st.blocks;
             let rec = |r: u64| -> &DedupRec { unsafe { &*blocks.get_unchecked((r >> 7) as usize).add((r & 127) as usize) } };
             for (bi, &blk) in st.blocks.iter().enumerate() {
@@ -1228,17 +1225,17 @@ impl Pipeline {
                     let rref = ((bi as u64) << 7) | i as u64;
                     let eid = r.eid;
                     let h = key_hash(eid);
-                    let tag = h >> 40;
-                    let entry = (tag << 40) | generation | (rref + 1);
+                    let tag = h >> 32;
+                    let entry = (tag << 32) | (rref + 1);
                     let mut s = h as usize & mask;
                     let table = st.table.as_mut_ptr(); // s is always masked into the table
                     loop {
                         let cur = unsafe { *table.add(s) };
-                        if cur & GEN != generation {
+                        if cur == 0 {
                             unsafe { *table.add(s) = entry };
                             break;
                         }
-                        if (cur >> 40) == tag {
+                        if (cur >> 32) == tag {
                             let o = rec((cur & 0xFFFFFFFF) - 1);
                             if o.eid == eid {
                                 if o.check() != r.check() {

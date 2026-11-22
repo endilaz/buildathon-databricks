@@ -25,9 +25,11 @@ echo "== NCPU=$NC: subm = origin/main image (Rust), cand = this branch (Rust), c
 for i in $(seq 1 15); do
   run subm "X=1" ./subm >> "$OUT"
   run cand "X=1" ./cand >> "$OUT"
-  run stage2 "X=1" ./v-stage2 >> "$OUT"
+  run stage1 "X=1" ./v-stage1 >> "$OUT"
+  run pd16 "X=1" ./v-pd16 >> "$OUT"
+  run nofilt "X=1" ./v-nofilter >> "$OUT"
+  run tune "X=1" ./v-tune >> "$OUT"
   run cppold "X=1" ./cppold >> "$OUT"
-  run cppnew "X=1" ./cpp >> "$OUT"
 done
 # outputs of the candidate and the submitted build must agree
 A=$(mktemp -d); B=$(mktemp -d)
