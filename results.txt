@@ -1,0 +1,105 @@
+== machine
+CPU(s):                                  4
+Model name:                              AMD EPYC 9V45 96-Core Processor
+Thread(s) per core:                      2
+Core(s) per socket:                      2
+L1d cache:                               96 KiB (2 instances)
+L2 cache:                                2 MiB (2 instances)
+L3 cache:                                32 MiB (1 instance)
+NUMA node(s):                            1
+avx2: yes; avx512bw: yes
+kernel 7.0.0-1020-azure; THP always [madvise] never
+host rustc 1.100.0 (0ef1bc386 2026-11-09)
+== NCPU=4: subm = origin/main image (Rust), cand = this branch (Rust), cppold = origin/main Dockerfile.cpp, cppnew = this branch Dockerfile.cpp
+subm     wall= 1262ms  setup=0.8 links=25.0 parse=913.7 dedup=69.8 sessions=204.3 output=31.1  user=4.45 sys=0.25 maxrss=1505752KB
+cand     wall= 1233ms  setup=0.8 links=23.2 parse=881.8 dedup=65.8 sessions=171.5 output=31.0  user=4.22 sys=0.27 maxrss=1497880KB
+stage1   wall= 1286ms  setup=0.8 links=24.7 parse=972.3 dedup=65.4 sessions=168.3 output=33.2  user=4.39 sys=0.26 maxrss=1497504KB
+pd12     wall= 1212ms  setup=1.2 links=35.3 parse=892.4 dedup=65.6 sessions=169.2 output=30.4  user=4.35 sys=0.25 maxrss=1501648KB
+nofilt   wall= 1225ms  setup=0.8 links=28.9 parse=915.0 dedup=65.8 sessions=169.1 output=30.0  user=4.42 sys=0.26 maxrss=1502044KB
+cppold   wall= 1228ms  setup=0.6 links=25.3 parse=864.2 dedup=70.3 sessions=208.4 output=41.3  user=4.26 sys=0.27 maxrss=1442560KB
+subm     wall= 1299ms  setup=0.8 links=24.0 parse=954.8 dedup=67.4 sessions=198.9 output=29.8  user=4.71 sys=0.24 maxrss=1501604KB
+cand     wall= 1258ms  setup=0.8 links=25.3 parse=869.0 dedup=65.2 sessions=173.5 output=29.8  user=4.17 sys=0.26 maxrss=1502132KB
+stage1   wall= 1184ms  setup=0.7 links=24.7 parse=871.9 dedup=62.8 sessions=166.5 output=30.4  user=4.19 sys=0.23 maxrss=1501236KB
+pd12     wall= 1203ms  setup=0.8 links=23.6 parse=877.0 dedup=64.1 sessions=167.5 output=31.4  user=4.24 sys=0.25 maxrss=1503700KB
+nofilt   wall= 1265ms  setup=0.9 links=25.6 parse=959.7 dedup=67.4 sessions=165.4 output=30.5  user=4.54 sys=0.28 maxrss=1495452KB
+cppold   wall= 1182ms  setup=0.6 links=24.0 parse=847.1 dedup=69.6 sessions=189.2 output=32.0  user=4.26 sys=0.23 maxrss=1462968KB
+subm     wall= 1258ms  setup=0.7 links=24.5 parse=915.8 dedup=69.4 sessions=201.0 output=31.0  user=4.54 sys=0.25 maxrss=1505316KB
+cand     wall= 1160ms  setup=0.7 links=24.4 parse=859.0 dedup=64.3 sessions=165.8 output=30.2  user=4.16 sys=0.26 maxrss=1499932KB
+stage1   wall= 1167ms  setup=0.8 links=23.8 parse=866.9 dedup=62.6 sessions=166.4 output=31.3  user=4.20 sys=0.24 maxrss=1499556KB
+pd12     wall= 1210ms  setup=0.8 links=27.0 parse=904.5 dedup=64.6 sessions=167.0 output=30.8  user=4.36 sys=0.25 maxrss=1502024KB
+nofilt   wall= 1179ms  setup=0.8 links=24.6 parse=875.7 dedup=65.3 sessions=165.3 output=31.3  user=4.24 sys=0.25 maxrss=1504132KB
+cppold   wall= 1187ms  setup=0.6 links=26.2 parse=848.3 dedup=70.5 sessions=190.1 output=33.6  user=4.22 sys=0.28 maxrss=1462852KB
+subm     wall= 1271ms  setup=0.8 links=25.3 parse=929.8 dedup=68.7 sessions=198.9 output=31.9  user=4.60 sys=0.24 maxrss=1505736KB
+cand     wall= 1148ms  setup=0.8 links=20.3 parse=847.7 dedup=63.8 sessions=168.9 output=30.9  user=4.11 sys=0.26 maxrss=1497320KB
+stage1   wall= 1172ms  setup=0.8 links=27.0 parse=861.2 dedup=65.7 sessions=170.3 output=31.1  user=4.20 sys=0.26 maxrss=1499760KB
+pd12     wall= 1190ms  setup=0.8 links=24.3 parse=883.4 dedup=63.5 sessions=170.0 output=32.0  user=4.28 sys=0.24 maxrss=1497996KB
+nofilt   wall= 1232ms  setup=0.8 links=24.4 parse=927.8 dedup=64.5 sessions=168.6 output=31.0  user=4.33 sys=0.28 maxrss=1497944KB
+cppold   wall= 1223ms  setup=0.6 links=22.5 parse=888.6 dedup=69.7 sessions=190.5 output=33.0  user=4.38 sys=0.26 maxrss=1459888KB
+subm     wall= 1349ms  setup=0.7 links=25.7 parse=996.5 dedup=66.8 sessions=212.3 output=31.4  user=4.91 sys=0.24 maxrss=1505712KB
+cand     wall= 1212ms  setup=1.0 links=23.9 parse=905.7 dedup=64.8 sessions=170.3 output=31.1  user=4.38 sys=0.24 maxrss=1502016KB
+stage1   wall= 1220ms  setup=0.7 links=27.0 parse=911.0 dedup=61.7 sessions=172.6 output=31.4  user=4.38 sys=0.27 maxrss=1500280KB
+pd12     wall= 1158ms  setup=0.8 links=28.2 parse=851.0 dedup=63.8 sessions=167.2 output=31.2  user=4.15 sys=0.25 maxrss=1499948KB
+nofilt   wall= 1187ms  setup=0.8 links=27.5 parse=875.9 dedup=66.1 sessions=169.7 output=31.3  user=4.27 sys=0.26 maxrss=1506384KB
+cppold   wall= 1196ms  setup=0.6 links=25.9 parse=855.4 dedup=70.1 sessions=192.3 output=33.1  user=4.28 sys=0.25 maxrss=1463972KB
+subm     wall= 1271ms  setup=0.8 links=24.4 parse=929.9 dedup=68.4 sessions=200.8 output=31.1  user=4.54 sys=0.24 maxrss=1503412KB
+cand     wall= 1211ms  setup=0.8 links=23.5 parse=906.5 dedup=64.4 sessions=169.6 output=31.1  user=4.35 sys=0.26 maxrss=1497396KB
+stage1   wall= 1178ms  setup=0.8 links=23.6 parse=872.4 dedup=65.0 sessions=169.2 output=31.9  user=4.19 sys=0.24 maxrss=1503840KB
+pd12     wall= 1188ms  setup=0.8 links=25.7 parse=881.0 dedup=64.1 sessions=169.5 output=31.5  user=4.26 sys=0.26 maxrss=1502032KB
+nofilt   wall= 1236ms  setup=0.8 links=24.1 parse=927.4 dedup=66.6 sessions=170.7 output=30.6  user=4.46 sys=0.24 maxrss=1498144KB
+cppold   wall= 1209ms  setup=0.6 links=29.5 parse=864.0 dedup=70.9 sessions=192.6 output=32.9  user=4.28 sys=0.26 maxrss=1461812KB
+subm     wall= 1374ms  setup=0.8 links=24.2 parse=955.8 dedup=67.5 sessions=203.7 output=30.5  user=4.71 sys=0.26 maxrss=1505328KB
+cand     wall= 1179ms  setup=0.8 links=21.6 parse=876.7 dedup=64.2 sessions=169.8 output=30.9  user=4.21 sys=0.25 maxrss=1501932KB
+stage1   wall= 1194ms  setup=0.8 links=26.6 parse=880.6 dedup=69.2 sessions=170.6 output=31.5  user=4.23 sys=0.24 maxrss=1497408KB
+pd12     wall= 1196ms  setup=0.8 links=23.7 parse=887.5 dedup=65.7 sessions=169.3 output=31.4  user=4.28 sys=0.24 maxrss=1502112KB
+nofilt   wall= 1186ms  setup=0.9 links=24.0 parse=879.0 dedup=66.3 sessions=168.9 output=31.0  user=4.27 sys=0.25 maxrss=1499876KB
+cppold   wall= 1201ms  setup=0.6 links=27.1 parse=859.6 dedup=69.7 sessions=192.3 output=33.1  user=4.27 sys=0.26 maxrss=1461132KB
+subm     wall= 1269ms  setup=0.7 links=21.4 parse=926.1 dedup=69.1 sessions=204.4 output=31.4  user=4.61 sys=0.23 maxrss=1505332KB
+cand     wall= 1210ms  setup=0.8 links=20.8 parse=908.5 dedup=64.7 sessions=168.3 output=30.7  user=4.35 sys=0.25 maxrss=1499780KB
+stage1   wall= 1219ms  setup=0.8 links=26.2 parse=909.5 dedup=64.3 sessions=171.3 output=31.0  user=4.36 sys=0.28 maxrss=1504052KB
+pd12     wall= 1196ms  setup=0.8 links=26.0 parse=887.5 dedup=62.8 sessions=171.5 output=31.6  user=4.33 sys=0.22 maxrss=1499488KB
+nofilt   wall= 1200ms  setup=0.9 links=24.6 parse=891.3 dedup=65.0 sessions=171.3 output=30.9  user=4.29 sys=0.27 maxrss=1502012KB
+cppold   wall= 1209ms  setup=0.6 links=25.1 parse=865.7 dedup=69.8 sessions=196.3 output=32.8  user=4.30 sys=0.28 maxrss=1460688KB
+subm     wall= 1270ms  setup=0.8 links=28.2 parse=921.9 dedup=68.6 sessions=203.5 output=30.8  user=4.61 sys=0.23 maxrss=1503596KB
+cand     wall= 1215ms  setup=0.8 links=25.0 parse=909.4 dedup=64.5 sessions=168.5 output=31.0  user=4.38 sys=0.26 maxrss=1503988KB
+stage1   wall= 1165ms  setup=0.8 links=27.5 parse=856.2 dedup=64.2 sessions=169.7 output=30.9  user=4.18 sys=0.24 maxrss=1498044KB
+pd12     wall= 1231ms  setup=0.8 links=26.6 parse=918.8 dedup=63.2 sessions=174.6 output=31.0  user=4.29 sys=0.27 maxrss=1501536KB
+nofilt   wall= 1212ms  setup=0.8 links=24.6 parse=900.9 dedup=65.6 sessions=173.0 output=31.2  user=4.37 sys=0.25 maxrss=1499564KB
+cppold   wall= 1205ms  setup=0.6 links=27.5 parse=864.3 dedup=69.0 sessions=192.6 output=33.3  user=4.28 sys=0.28 maxrss=1464952KB
+subm     wall= 1281ms  setup=0.9 links=27.3 parse=929.8 dedup=68.8 sessions=207.8 output=31.0  user=4.61 sys=0.26 maxrss=1505596KB
+cand     wall= 1193ms  setup=0.8 links=25.0 parse=875.0 dedup=68.9 sessions=174.4 output=33.5  user=4.26 sys=0.25 maxrss=1501188KB
+stage1   wall= 1211ms  setup=0.8 links=24.4 parse=888.8 dedup=68.0 sessions=182.4 output=30.6  user=4.33 sys=0.25 maxrss=1492924KB
+pd12     wall= 1220ms  setup=0.8 links=26.8 parse=903.7 dedup=64.8 sessions=176.7 output=31.4  user=4.38 sys=0.25 maxrss=1501556KB
+nofilt   wall= 1212ms  setup=0.8 links=27.9 parse=897.5 dedup=64.9 sessions=175.1 output=30.7  user=4.36 sys=0.26 maxrss=1506132KB
+cppold   wall= 1250ms  setup=0.6 links=24.2 parse=907.7 dedup=70.6 sessions=194.9 output=33.1  user=4.51 sys=0.25 maxrss=1463976KB
+subm     wall= 1319ms  setup=0.9 links=26.3 parse=973.4 dedup=69.0 sessions=204.5 output=29.8  user=4.79 sys=0.23 maxrss=1507844KB
+cand     wall= 1192ms  setup=0.8 links=26.2 parse=882.5 dedup=65.8 sessions=170.1 output=31.2  user=4.26 sys=0.25 maxrss=1507380KB
+stage1   wall= 1211ms  setup=0.8 links=27.4 parse=889.4 dedup=65.1 sessions=178.7 output=33.6  user=4.36 sys=0.25 maxrss=1499988KB
+pd12     wall= 1209ms  setup=0.8 links=29.1 parse=893.2 dedup=64.5 sessions=174.0 output=31.9  user=4.32 sys=0.24 maxrss=1503480KB
+nofilt   wall= 1260ms  setup=0.8 links=27.8 parse=943.5 dedup=66.2 sessions=173.4 output=32.0  user=4.52 sys=0.28 maxrss=1504256KB
+cppold   wall= 1203ms  setup=0.7 links=27.2 parse=861.9 dedup=68.8 sessions=192.4 output=32.6  user=4.31 sys=0.25 maxrss=1463932KB
+subm     wall= 1272ms  setup=0.8 links=24.9 parse=926.8 dedup=67.9 sessions=205.3 output=31.3  user=4.59 sys=0.25 maxrss=1507884KB
+cand     wall= 1192ms  setup=0.8 links=23.6 parse=886.8 dedup=64.5 sessions=169.2 output=30.4  user=4.24 sys=0.27 maxrss=1497824KB
+stage1   wall= 1221ms  setup=0.8 links=27.8 parse=908.6 dedup=66.3 sessions=171.2 output=30.7  user=4.40 sys=0.24 maxrss=1504040KB
+pd12     wall= 1190ms  setup=0.8 links=28.0 parse=877.1 dedup=66.2 sessions=172.5 output=30.0  user=4.29 sys=0.25 maxrss=1501228KB
+nofilt   wall= 1198ms  setup=0.8 links=27.7 parse=880.7 dedup=66.2 sessions=175.5 output=31.8  user=4.33 sys=0.24 maxrss=1502516KB
+cppold   wall= 1210ms  setup=0.6 links=26.8 parse=866.9 dedup=71.2 sessions=192.0 output=33.5  user=4.30 sys=0.26 maxrss=1463780KB
+subm     wall= 1267ms  setup=0.8 links=25.8 parse=923.4 dedup=68.2 sessions=201.7 output=31.2  user=4.58 sys=0.26 maxrss=1501220KB
+cand     wall= 1173ms  setup=1.0 links=22.7 parse=866.3 dedup=65.3 sessions=167.9 output=31.1  user=4.20 sys=0.25 maxrss=1502012KB
+stage1   wall= 1188ms  setup=0.8 links=27.9 parse=874.0 dedup=63.4 sessions=173.3 output=32.1  user=4.27 sys=0.25 maxrss=1501672KB
+pd12     wall= 1189ms  setup=0.8 links=27.3 parse=877.6 dedup=64.4 sessions=172.1 output=30.7  user=4.28 sys=0.25 maxrss=1503828KB
+nofilt   wall= 1246ms  setup=0.8 links=25.1 parse=934.5 dedup=67.8 sessions=170.4 output=31.3  user=4.49 sys=0.26 maxrss=1501652KB
+cppold   wall= 1208ms  setup=0.6 links=25.8 parse=867.3 dedup=70.2 sessions=193.2 output=32.9  user=4.32 sys=0.26 maxrss=1465200KB
+subm     wall= 1267ms  setup=0.8 links=24.8 parse=922.8 dedup=67.6 sessions=205.9 output=29.8  user=4.58 sys=0.25 maxrss=1503020KB
+cand     wall= 1225ms  setup=0.8 links=22.6 parse=920.3 dedup=64.2 sessions=170.3 output=31.0  user=4.36 sys=0.24 maxrss=1503656KB
+stage1   wall= 1224ms  setup=0.8 links=24.1 parse=916.9 dedup=64.5 sessions=171.7 output=30.7  user=4.40 sys=0.27 maxrss=1497892KB
+pd12     wall= 1198ms  setup=0.8 links=26.3 parse=889.0 dedup=63.3 sessions=171.3 output=31.4  user=4.29 sys=0.26 maxrss=1500136KB
+nofilt   wall= 1217ms  setup=0.8 links=29.2 parse=897.2 dedup=68.0 sessions=173.6 output=30.6  user=4.37 sys=0.24 maxrss=1504160KB
+cppold   wall= 1197ms  setup=0.6 links=24.2 parse=858.9 dedup=69.7 sessions=192.4 output=33.4  user=4.26 sys=0.27 maxrss=1463112KB
+subm     wall= 1277ms  setup=0.8 links=25.5 parse=932.0 dedup=68.3 sessions=203.0 output=32.0  user=4.65 sys=0.23 maxrss=1501596KB
+cand     wall= 1171ms  setup=0.8 links=25.4 parse=867.6 dedup=63.7 sessions=166.9 output=31.0  user=4.18 sys=0.24 maxrss=1505764KB
+stage1   wall= 1166ms  setup=0.8 links=25.4 parse=861.0 dedup=64.2 sessions=168.5 output=31.3  user=4.20 sys=0.24 maxrss=1503844KB
+pd12     wall= 1199ms  setup=0.8 links=27.4 parse=891.2 dedup=63.5 sessions=169.9 output=31.2  user=4.23 sys=0.27 maxrss=1502160KB
+nofilt   wall= 1231ms  setup=1.3 links=31.2 parse=914.3 dedup=66.1 sessions=170.7 output=31.2  user=4.40 sys=0.26 maxrss=1500004KB
+cppold   wall= 1197ms  setup=0.6 links=27.2 parse=854.8 dedup=69.2 sessions=193.5 output=33.0  user=4.27 sys=0.26 maxrss=1459904KB
+user_daily: bytes differ (row order may differ; compare locally)
+campaign_daily: identical bytes

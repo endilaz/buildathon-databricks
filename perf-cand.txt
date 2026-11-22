@@ -1,0 +1,16 @@
+    37.26%  cand-g   cand-g                                [.] <shopping_sessions::Pipeline>::process::<u64>::{closure#1}::{closure#0}::{closure#0}
+    17.90%  cand-g   cand-g                                [.] <shopping_sessions::Pipeline>::process::<u64>::{closure#1}
+    11.27%  cand-g   cand-g                                [.] <shopping_sessions::Pipeline>::finish::<u64>::{closure#6}
+     7.01%  cand-g   cand-g                                [.] <shopping_sessions::Pipeline>::process::<u64>::{closure#1}::{closure#0}::{closure#1}
+     5.43%  cand-g   cand-g                                [.] <shopping_sessions::Pipeline>::finish::<u64>::{closure#1}
+     3.02%  cand-g   cand-g                                [.] shopping_sessions::sessions::radix_by_time::<u64, u32>
+     2.43%  cand-g   cand-g                                [.] shopping_sessions::base::long_key
+     2.31%  cand-g   [kernel.kallsyms]                     [k] _copy_to_iter
+     1.50%  cand-g   [kernel.kallsyms]                     [k] kernel_init_pages
+     1.34%  cand-g   cand-g                                [.] shopping_sessions::base::record_long
+     1.30%  cand-g   cand-g                                [.] shopping_sessions::build_persons::{closure#3}
+     1.29%  cand-g   cand-g                                [.] shopping_sessions::base::long_bytes
+     1.06%  cand-g   cand-g                                [.] <shopping_sessions::Persons>::name_hashed
+     0.66%  cand-g   cand-g                                [.] shopping_sessions::build_persons
+     0.58%  cand-g   cand-g                                [.] __memmove_avx512_unaligned_erms
+     0.57%  cand-g   cand-g                                [.] <shopping_sessions::Pipeline>::run::{closure#8}

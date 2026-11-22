@@ -1,0 +1,17 @@
+    37.01%  cpp-g    cpp-g              [.] void ss::(anonymous namespace)::Pipeline::parse_event<unsigned long>(std::basic_string_view<char, std::char_traits<char> > (&) [7], ss::(anonymous namespace)::Pipeline::ParseSt
+    17.07%  cpp-g    cpp-g              [.] ss::run_tasks<ss::(anonymous namespace)::Pipeline::ParseState<unsigned long>, ss::(anonymous namespace)::Pipeline::process<unsigned long>(std::vector<std::vector<std::pair<unsi
+    12.16%  cpp-g    cpp-g              [.] ss::(anonymous namespace)::Pipeline::finish<unsigned long>(std::vector<ss::(anonymous namespace)::Pipeline::ParseState<unsigned long>, std::allocator<ss::(anonymous namespace):
+     7.98%  cpp-g    cpp-g              [.] void ss::(anonymous namespace)::Pipeline::parse_click<unsigned long>(std::basic_string_view<char, std::char_traits<char> > (&) [4], ss::(anonymous namespace)::Pipeline::ParseSt
+     5.49%  cpp-g    cpp-g              [.] ss::run_tasks<ss::(anonymous namespace)::Pipeline::finish<unsigned long>(std::vector<ss::(anonymous namespace)::Pipeline::ParseState<unsigned long>, std::allocator<ss::(anonymo
+     2.86%  cpp-g    cpp-g              [.] void ss::radix_by_time<unsigned long, unsigned int>(std::vector<unsigned long, std::allocator<unsigned long> >&, std::vector<unsigned int, std::allocator<unsigned int> >&, std:
+     2.47%  cpp-g    cpp-g              [.] ss::long_key(char const*, unsigned long, unsigned short&) [clone .constprop.0]
+     2.04%  cpp-g    [kernel.kallsyms]  [k] _copy_to_iter
+     1.52%  cpp-g    [kernel.kallsyms]  [k] kernel_init_pages
+     1.26%  cpp-g    cpp-g              [.] ss::record_long(unsigned long, unsigned short, char const*, unsigned long)
+     0.99%  cpp-g    cpp-g              [.] ss::(anonymous namespace)::build_persons(std::vector<std::vector<std::pair<unsigned long, unsigned long>, std::allocator<std::pair<unsigned long, unsigned long> > >, std::alloc
+     0.99%  cpp-g    cpp-g              [.] std::thread::_State_impl<std::thread::_Invoker<std::tuple<ss::run_tasks<int, ss::(anonymous namespace)::build_persons(std::vector<std::vector<std::pair<unsigned long, unsigned 
+     0.92%  cpp-g    cpp-g              [.] std::thread::_State_impl<std::thread::_Invoker<std::tuple<ss::run_tasks<int, ss::(anonymous namespace)::build_persons(std::vector<std::vector<std::pair<unsigned long, unsigned 
+     0.86%  cpp-g    cpp-g              [.] ss::long_bytes(unsigned long)
+     0.65%  cpp-g    cpp-g              [.] ss::(anonymous namespace)::Pipeline::write_users(std::vector<ss::UserRow, std::allocator<ss::UserRow> > const&, std::__cxx11::basic_string<char, std::char_traits<char>, std::al
+     0.65%  cpp-g    cpp-g              [.] void std::__introsort_loop<__gnu_cxx::__normal_iterator<unsigned long*, std::vector<unsigned long, std::allocator<unsigned long> > >, long, __gnu_cxx::__ops::_Iter_less_iter>(_
+     0.51%  cpp-g    cpp-g              [.] std::thread::_State_impl<std::thread::_Invoker<std::tuple<ss::run_tasks<std::vector<std::pair<unsigned long, unsigned long>, std::allocator<std::pair<unsigned long, unsigned lo
