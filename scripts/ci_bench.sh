@@ -27,12 +27,11 @@ run_env() {  # name env binary
   printf "%-6s wall=%5sms  " "$1" $(( (e-s)/1000000 ))
   awk '/ms\]/{printf "%s=%s ", $4, $5} /^time:/{printf " %s %s %s %s", $2, $3, $4, $5}' /tmp/log; echo
 }
-echo "== THP=madvise NCPU=$NC: main=0e598b9, single=519adf7 (unstaged), staged=this branch (pread default; mmap via SHOPPING_MMAP=1)" >> "$OUT"
-for i in 1 2 3 4 5 6 7 8; do
+echo "== THP=madvise NCPU=$NC: main=0e598b9 (docker image) vs sweep variants of this branch (native g++, mmap unless -pr)" >> "$OUT"
+for i in 1 2 3 4 5 6; do
   run_env main "X=1" ./bin-0e598b9 >> "$OUT"
-  run_env single "X=1" ./bin-519adf7 >> "$OUT"
-  run_env staged "X=1" ./ours >> "$OUT"
-  run_env stagmm "SHOPPING_MMAP=1" ./ours >> "$OUT"
+  for v in pd8 pd12 pd16 pd24 pb1k pb2k; do run_env $v "SHOPPING_MMAP=1" ./v-$v >> "$OUT"; done
+  run_env pd12pr "X=1" ./v-pd12 >> "$OUT"
 done
 # hardware counters and profiles (may be unavailable in the VM)
 sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" > /dev/null 2>&1 || true

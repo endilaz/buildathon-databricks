@@ -19,13 +19,18 @@ jobs:
         run: |
           docker build -q -t ours .
           cid=$(docker create ours) && docker cp $cid:/shopping-sessions ./ours && docker rm $cid
-      - name: Build an unstripped copy for profiling
+      - name: Build an unstripped copy for profiling, and the sweep variants
         run: |
-          make CXX=g++ ARCHFLAGS="-march=x86-64-v3 -mtune=cascadelake" \
-            CXXFLAGS="-O3 -DNDEBUG -flto=auto -fno-plt -g -fno-omit-frame-pointer" LDFLAGS=-static BIN=ours-g
+          F="-O3 -DNDEBUG -flto=auto -fno-plt"
+          A="-march=x86-64-v3 -mtune=cascadelake"
+          make -s CXX=g++ ARCHFLAGS="$A" CXXFLAGS="$F -g -fno-omit-frame-pointer" LDFLAGS=-static BIN=ours-g
+          for v in "pd8:-DSS_PD=8" "pd12:-DSS_PD=12" "pd16:-DSS_PD=16" "pd24:-DSS_PD=24" \
+                   "pb1k:-DSS_PD=12 -DSS_PBE=32768" "pb2k:-DSS_PD=12 -DSS_PBE=16384"; do
+            make -s -B CXX=g++ ARCHFLAGS="$A" CXXFLAGS="$F ${v#*:}" LDFLAGS=-static BIN=v-${v%%:*}
+          done
       - name: Build the base images (origin/main and the unstaged single scatter)
         run: |
-          for c in 0e598b9 519adf7; do
+          for c in 0e598b9; do
             git worktree add -q wt-$c $c
             docker build -q -t img-$c wt-$c
             cid=$(docker create img-$c) && docker cp $cid:/shopping-sessions ./bin-$c && docker rm $cid
