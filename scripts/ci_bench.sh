@@ -26,7 +26,13 @@ for i in $(seq 1 10); do
   run subm "X=1" ./subm >> "$OUT"
   run cand "X=1" ./cand >> "$OUT"
   run base "X=1" ./v-base >> "$OUT"
-  for f in scan128 smalldd pd16 mixhash civilref ddclear; do run $f "X=1" ./v-$f >> "$OUT"; done
+  run stage2 "X=1" ./v-stage2 >> "$OUT"
+  run fb4 "SHOPPING_FBITS=4" ./cand >> "$OUT"
+  run fb2 "SHOPPING_FBITS=2" ./cand >> "$OUT"
+  run pbe16k "SHOPPING_PBE=16384" ./cand >> "$OUT"
+  run pbe64k "SHOPPING_PBE=65536" ./cand >> "$OUT"
+  run pc128k "SHOPPING_PIECE=131072" ./cand >> "$OUT"
+  run pc512k "SHOPPING_PIECE=524288" ./cand >> "$OUT"
   run cpp "X=1" ./cpp >> "$OUT"
 done
 # outputs of the candidate and the submitted build must agree

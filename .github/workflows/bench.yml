@@ -32,7 +32,7 @@ jobs:
           T=x86_64-unknown-linux-gnu
           F="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
           RUSTFLAGS="$F" cargo build -q --release --offline --target $T && cp target/$T/release/shopping-sessions ../v-base
-          for f in scan128 smalldd pd16 mixhash civilref ddclear; do
+          for f in stage2; do
             RUSTFLAGS="$F" cargo build -q --release --offline --features $f --target $T
             cp target/$T/release/shopping-sessions ../v-$f
           done

@@ -175,28 +175,42 @@ pub fn mum(a: u64, b: u64) -> u64 {
     (r as u64) ^ ((r >> 64) as u64)
 }
 
-// Two independent 64-bit hashes of the bytes.
+// Two independent 64-bit hashes of the bytes: two multiply chains, 16 bytes
+// a step (both words feed each 128-bit multiply, as in wyhash), so a 33-byte
+// ID takes three dependent multiplies per chain.
+#[inline]
+fn read_tail(s: &[u8]) -> u64 {
+    let mut t = [0u8; 8];
+    t[..s.len()].copy_from_slice(s);
+    u64::from_le_bytes(t)
+}
 pub fn id_hash(s: &[u8]) -> (u64, u64) {
     const K1: u64 = 0xA0761D6478BD642F;
     const K2: u64 = 0xE7037ED1A0B428DB;
+    const K3: u64 = 0x8EBC6AF09C88C6E3;
+    const K4: u64 = 0x589965CC75374CC3;
     let n = s.len();
     let mut a = 0x243F6A8885A308D3u64 ^ n as u64;
     let mut b = 0x13198A2E03707344u64 ^ ((n as u64) << 32);
     let mut i = 0;
-    while i + 8 <= n {
-        let w = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
-        a = mum(a ^ w, K1);
-        b = mum(b ^ w, K2);
-        i += 8;
+    while i + 16 <= n {
+        let w0 = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(s[i + 8..i + 16].try_into().unwrap());
+        a = mum(a ^ w0 ^ K1, w1 ^ K2);
+        b = mum(b ^ w1 ^ K3, w0 ^ K4);
+        i += 16;
     }
     if i < n {
-        let mut t = [0u8; 8];
-        t[..n - i].copy_from_slice(&s[i..]);
-        let w = u64::from_le_bytes(t);
-        a = mum(a ^ w, K1);
-        b = mum(b ^ w, K2);
+        let rest = &s[i..];
+        let (w0, w1) = if rest.len() > 8 {
+            (u64::from_le_bytes(rest[..8].try_into().unwrap()), read_tail(&rest[8..]))
+        } else {
+            (read_tail(rest), 0)
+        };
+        a = mum(a ^ w0 ^ K1, w1 ^ K2);
+        b = mum(b ^ w1 ^ K3, w0 ^ K4);
     }
-    (mum(a ^ 0x8EBC6AF09C88C6E3, 0x589965CC75374CC3), mum(b ^ 0x1D8E4E27C47D124F, 0xEB44ACCAB455D165))
+    (mum(a ^ 0x1D8E4E27C47D124F, 0xEB44ACCAB455D165), mum(b ^ 0x2D358DCCAA6C78A5, 0x8BB84B93962EACC9))
 }
 
 #[repr(C)]
@@ -562,5 +576,35 @@ impl Timer {
             (now - self.last).as_secs_f64() * 1e3
         );
         self.last = now;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // No collisions in either hash, or in their pair, over a million IDs in
+    // the generator's two shapes and every length up to 40.
+    #[test]
+    fn id_hash_spreads() {
+        use std::collections::HashSet;
+        let (mut h1s, mut h2s, mut ids) = (HashSet::new(), HashSet::new(), HashSet::new());
+        let mut x = 0x9E3779B97F4A7C15u64;
+        for i in 0..1_000_000u64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let id = match i % 3 {
+                0 => format!("u{:016x}{:016x}", x, x.rotate_left(29)),
+                1 => format!("e{:032x}", i),
+                _ => format!("k{}", &format!("{:040}", x)[..(i % 40) as usize]),
+            };
+            if !ids.insert(id.clone()) {
+                continue; // the same ID again: equal hashes are right
+            }
+            let (a, b) = id_hash(id.as_bytes());
+            assert!(h1s.insert(a), "h1 collision on {id}");
+            assert!(h2s.insert(b), "h2 collision on {id}");
+        }
     }
 }

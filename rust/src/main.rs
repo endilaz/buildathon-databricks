@@ -33,7 +33,12 @@ static GLOBAL: Alloc = Alloc;
 const EVENT_BUCKET_LINES: usize = 32768;
 #[cfg(not(feature = "smalldd"))]
 const EVENT_BUCKET_LINES: usize = 65536;
-const PERSON_BUCKET_EVENTS: usize = 32768; // person buckets: few enough that staging groups stay in L2
+// person buckets: few enough that staging groups stay in cache
+// (SHOPPING_PBE overrides, for sweeps)
+const PERSON_BUCKET_EVENTS: usize = 32768;
+fn env_size(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|s| s.parse().ok()).filter(|&v| v > 0).unwrap_or(default)
+}
 
 // ---------------------------------------------------------------- records
 
@@ -235,6 +240,21 @@ impl Persons {
             filter_mask: 63,
         }
     }
+    // At parse time: the slot chosen and prefetched (one stage), or with
+    // stage2 only the filter word prefetched and null returned (the slot is
+    // chosen LOOKUP_STAGE lines later).
+    #[inline(always)]
+    fn first_stage(&self, h: u64) -> *const KeySlot<Key> {
+        if cfg!(feature = "stage2") {
+            let i = (h >> FILTER_SHIFT) as usize & self.filter_mask;
+            prefetch(unsafe { self.filter.as_ptr().add(i >> 6) });
+            std::ptr::null()
+        } else {
+            let slot = self.lookup_slot(h);
+            prefetch(slot);
+            slot
+        }
+    }
     // The slot a lookup of user (h = key_hash(user)) should read: its first
     // slot in the table if the filter has its bit, else EMPTY_SLOT.
     #[inline(always)]
@@ -342,8 +362,9 @@ fn build_persons(pairs: &mut Vec<Vec<(Key, Key)>>, threads: usize) -> Persons {
     while (1usize << region_bits) * 2 < most * 3 {
         region_bits += 1;
     }
-    // filter: 8 bits per endpoint, at least 2^16, at most 2^30
-    let fbits = pow2_at_least(8 * 2 * n).clamp(1 << 16, 1 << 30);
+    // filter: 8 bits per endpoint (SHOPPING_FBITS overrides, for sweeps),
+    // at least 2^16, at most 2^30
+    let fbits = pow2_at_least(env_size("SHOPPING_FBITS", 8) * 2 * n).clamp(1 << 16, 1 << 30);
     let mut out = Persons {
         slots: vec![KeySlot { k: 0, v: 0 }; PARTS << region_bits],
         region_bits,
@@ -520,12 +541,18 @@ fn restart(var: &str, val: &str) -> ! {
 // ---------------------------------------------------------------- parse
 
 // Person lookups during the parse run this many lines after their prefetch,
-// so each (DRAM) miss overlaps the parsing of the lines between.
+// so each (DRAM) miss overlaps the parsing of the lines between. Feature
+// stage2 does it in two stages: a line's filter word is prefetched when it
+// is parsed, and LOOKUP_STAGE lines later (the word now cached) its slot is
+// chosen and prefetched (for caches too small for the filter: slower on the
+// M5, where it fits).
+// pread pieces (SHOPPING_PIECE overrides, for sweeps)
 const READ_PIECE: usize = 256 << 10;
 #[cfg(not(feature = "pd16"))]
 const PARSE_DELAY: usize = 12;
 #[cfg(feature = "pd16")]
 const PARSE_DELAY: usize = 16;
+const LOOKUP_STAGE: usize = PARSE_DELAY / 2;
 
 // A long ID read at parse time, recorded (base.rs) when its line is flushed,
 // by then with its table slot prefetched. The bytes are still in the piece
@@ -553,7 +580,7 @@ struct PendingEvent<E: Ev> {
     ingest: i64,
     ev: E,
     h: u64, // key_hash(user)
-    slot: *const KeySlot<Key>, // Persons::lookup_slot(h), prefetched
+    slot: *const KeySlot<Key>, // Persons::lookup_slot(h), prefetched (null until chosen)
     user_ref: LongRef,
     eid_check: u16,
 }
@@ -609,7 +636,9 @@ impl Ctx<'_> {
     #[inline(always)]
     fn flush_event<E: Ev>(&self, st: &mut ParseState<E>, i: usize) {
         let x = st.pending_ev[i];
-        let (person, linked) = self.persons.name_at(x.user, x.h, x.slot);
+        // lines drained before their second stage choose the slot now
+        let slot = if x.slot.is_null() { self.persons.lookup_slot(x.h) } else { x.slot };
+        let (person, linked) = self.persons.name_at(x.user, x.h, slot);
         // a linked ID's bytes were recorded with the links
         #[cfg(feature = "probe")]
         if probe::skip('e') || probe::skip('d') || probe::skip('r') {
@@ -642,7 +671,10 @@ impl Ctx<'_> {
     fn flush_click<E: Ev>(&self, st: &mut ParseState<E>, i: usize) {
         let mut c = st.pending_ck[i];
         let (user, cid) = (c.person, c.cid);
-        let (person, linked) = self.persons.name_at(user, st.pending_ck_h[i], st.pending_ck_slot[i]);
+        let h = st.pending_ck_h[i];
+        let slot = st.pending_ck_slot[i];
+        let slot = if slot.is_null() { self.persons.lookup_slot(h) } else { slot };
+        let (person, linked) = self.persons.name_at(user, h, slot);
         c.person = person;
         if is_long(user) && !linked {
             st.pending_ck_user[i].record(user);
@@ -700,8 +732,7 @@ impl Ctx<'_> {
                         let mut check = 0u16;
                         let user = make_key_check(f[1].bytes(), &mut check);
                         let h = key_hash(user);
-                        let slot = self.persons.lookup_slot(h);
-                        prefetch(slot);
+                        let first = self.persons.first_stage(h);
                         if is_long(user) {
                             prefetch_long(user);
                         }
@@ -709,13 +740,19 @@ impl Ctx<'_> {
                         if st.nev >= PARSE_DELAY {
                             self.flush_event(st, i);
                         }
+                        if cfg!(feature = "stage2") && st.nev >= LOOKUP_STAGE {
+                            let j = (st.nev - LOOKUP_STAGE) % PARSE_DELAY;
+                            let slot = self.persons.lookup_slot(st.pending_ev[j].h);
+                            prefetch(slot);
+                            st.pending_ev[j].slot = slot;
+                        }
                         st.pending_ev[i] = PendingEvent {
                             eid,
                             user,
                             ingest,
                             ev: E::event((ts - w.start) as u64, cat, price),
                             h,
-                            slot,
+                            slot: first,
                             user_ref: LongRef::of(f[1], check),
                             eid_check,
                         };
@@ -750,8 +787,7 @@ impl Ctx<'_> {
         let user = make_key_check(f[1].bytes(), &mut ucheck);
         let cid = make_key_check(f[0].bytes(), &mut ccheck);
         let h = key_hash(user);
-        let slot = self.persons.lookup_slot(h);
-        prefetch(slot);
+        let first = self.persons.first_stage(h);
         if is_long(user) {
             prefetch_long(user);
         }
@@ -762,10 +798,16 @@ impl Ctx<'_> {
         if st.nck >= PARSE_DELAY {
             self.flush_click(st, i);
         }
+        if cfg!(feature = "stage2") && st.nck >= LOOKUP_STAGE {
+            let j = (st.nck - LOOKUP_STAGE) % PARSE_DELAY;
+            let slot = self.persons.lookup_slot(st.pending_ck_h[j]);
+            prefetch(slot);
+            st.pending_ck_slot[j] = slot;
+        }
         st.pending_ck[i] =
             PersonClick { person: user, cid, rel: E::rel((ts - self.w.click_start) as u64), camp };
         st.pending_ck_h[i] = h;
-        st.pending_ck_slot[i] = slot;
+        st.pending_ck_slot[i] = first;
         st.pending_ck_user[i] = LongRef::of(f[1], ucheck);
         st.pending_ck_cid[i] = LongRef::of(f[0], ccheck);
         st.nck += 1;
@@ -1053,7 +1095,7 @@ impl Pipeline {
         let threads = self.threads;
         let est_lines = ev_bytes / 72 + 1;
         let event_buckets = pow2_at_least(est_lines / EVENT_BUCKET_LINES).clamp(16, 4096);
-        let person_buckets = pow2_at_least(est_lines / PERSON_BUCKET_EVENTS).clamp(16, 8192);
+        let person_buckets = pow2_at_least(est_lines / env_size("SHOPPING_PBE", PERSON_BUCKET_EVENTS)).clamp(16, 8192);
         let t0 = Instant::now();
         let persons = build_persons(&mut link_pairs, threads);
         if self.timer.on {
@@ -1079,6 +1121,7 @@ impl Pipeline {
             let event_chunks = chunks.len();
             plan_chunks(&click_files, 4 << 20, &mut chunks);
             let ctx = &ctx;
+            let read_piece = env_size("SHOPPING_PIECE", READ_PIECE).max(4096);
             run_tasks(&mut parsed, chunks.len(), |st, i| {
                 let c = &chunks[i];
                 let is_event = i < event_chunks;
@@ -1104,7 +1147,7 @@ impl Pipeline {
                     // line) through the end of the line that crosses its end.
                     let mut ps = c.s;
                     while ps < c.e {
-                        let pe = c.e.min(ps + READ_PIECE);
+                        let pe = c.e.min(ps + read_piece);
                         let from = ps.saturating_sub(1);
                         let mut to = file.len.min(pe + 4096);
                         loop {
@@ -1122,7 +1165,7 @@ impl Pipeline {
                         let d = st.buf.as_ptr();
                         parse_range(st, d, to - from, ps - from, pe - from);
                         ctx.drain(st); // pending lines point into buf
-                        ps += READ_PIECE;
+                        ps += read_piece;
                     }
                 }
                 ctx.drain(st); // nothing may stay pending once the chunk is done

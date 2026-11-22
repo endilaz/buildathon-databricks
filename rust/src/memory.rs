@@ -336,12 +336,13 @@ impl<T: Copy> StagedScatter<T> {
         #[cfg(not(target_arch = "x86_64"))]
         std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, bytes);
     }
+    // i < the bucket count: callers take it from the top bits of a hash
     #[inline(always)]
     pub fn push(&mut self, i: usize, x: T) -> *mut T {
-        if self.cursors[i].fill == BLOCK {
+        if unsafe { self.cursors.get_unchecked(i) }.fill == BLOCK {
             self.grow(i);
         }
-        let c = &mut self.cursors[i];
+        let c = unsafe { self.cursors.get_unchecked_mut(i) };
         unsafe {
             let g = self.stage.as_mut_ptr().add(i * GROUP as usize);
             g.add(c.staged as usize).write(x);
