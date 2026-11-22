@@ -4,6 +4,9 @@
 #include "base.hpp"
 #include <filesystem>
 #include <tuple>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -248,6 +251,99 @@ public:
     }
     size_t num_blocks(size_t i) const { return blocks_[i].size(); }
     // Block j of bucket i and its length.
+    std::pair<const T*, u32> block(size_t i, size_t j) const {
+        auto& b = blocks_[i];
+        return {b[j], j + 1 == b.size() ? cursors_[i].fill : kBlock};
+    }
+    template <class F>
+    void for_each(size_t i, F f) const {
+        auto& b = blocks_[i];
+        for (size_t j = 0; j < b.size(); ++j) {
+            const T* p = b[j];
+            u32 n = j + 1 == b.size() ? cursors_[i].fill : kBlock;
+            for (u32 k = 0; k < n; ++k) f(p[k]);
+        }
+    }
+};
+
+// Orders this thread's non-temporal stores before anything it does next.
+inline void store_fence() {
+#if defined(__SSE2__)
+    _mm_sfence();
+#endif
+}
+
+// A Scatter whose pushes go through a small staging group per bucket (write
+// combining): a full group of kGroup records is copied to the bucket's block
+// with non-temporal stores on x86, so writing the blocks costs no reads of
+// their lines. A record's final address is known when it is staged. Call
+// flush() once the pushes are done and before anything reads the buckets.
+template <class T>
+class StagedScatter {
+public:
+    static constexpr u32 kBlock = 128, kGroup = 8;
+    static_assert(kBlock % kGroup == 0 && (kGroup * sizeof(T)) % 64 == 0, "groups must fill whole cache lines");
+
+private:
+    struct Cursor {
+        T* cur = nullptr;
+        u32 fill = kBlock;  // records of cur already written (a multiple of kGroup)
+        u32 staged = 0;     // records waiting in the bucket's group
+    };
+    Arena arena_;
+    std::vector<Cursor> cursors_;
+    std::vector<T> stage_;  // kGroup records per bucket
+    std::vector<std::vector<T*>> blocks_;
+
+    [[gnu::noinline]] void grow(size_t i) {
+        Cursor& c = cursors_[i];
+        c.cur = static_cast<T*>(arena_.alloc(sizeof(T) * kBlock));
+        c.fill = 0;
+        blocks_[i].push_back(c.cur);
+    }
+    static void copy_group(T* dst, const T* src, size_t bytes) {
+#if defined(__SSE2__)
+        auto* d = reinterpret_cast<__m128i*>(dst);
+        auto* s = reinterpret_cast<const __m128i*>(src);
+        for (size_t k = 0; k < bytes / 16; ++k) _mm_stream_si128(d + k, _mm_loadu_si128(s + k));
+#else
+        std::memcpy(static_cast<void*>(dst), src, bytes);
+#endif
+    }
+
+public:
+    explicit StagedScatter(size_t n = 1) : cursors_(n), stage_(n * kGroup), blocks_(n) {}
+    inline T* push(size_t i, const T& x) {
+        Cursor& c = cursors_[i];
+        if (c.fill == kBlock) [[unlikely]] grow(i);
+        T* g = stage_.data() + i * kGroup;
+        g[c.staged] = x;
+        T* final_place = c.cur + c.fill + c.staged;
+        if (++c.staged == kGroup) {
+            copy_group(c.cur + c.fill, g, sizeof(T) * kGroup);
+            c.fill += kGroup;
+            c.staged = 0;
+        }
+        return final_place;
+    }
+    void flush() {
+        for (size_t i = 0; i < cursors_.size(); ++i) {
+            Cursor& c = cursors_[i];
+            if (c.staged) {
+                std::memcpy(static_cast<void*>(c.cur + c.fill), stage_.data() + i * kGroup, sizeof(T) * c.staged);
+                c.fill += c.staged;
+                c.staged = 0;
+            }
+        }
+#if defined(__SSE2__)
+        _mm_sfence();  // the streamed lines are visible before anyone reads them
+#endif
+    }
+    size_t size(size_t i) const {
+        size_t n = blocks_[i].size();
+        return n == 0 ? 0 : (n - 1) * kBlock + cursors_[i].fill;
+    }
+    size_t num_blocks(size_t i) const { return blocks_[i].size(); }
     std::pair<const T*, u32> block(size_t i, size_t j) const {
         auto& b = blocks_[i];
         return {b[j], j + 1 == b.size() ? cursors_[i].fill : kBlock};

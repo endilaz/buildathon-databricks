@@ -19,8 +19,8 @@
 namespace ss {
 namespace {
 
-constexpr size_t kEventBucketLines = 32768;  // event_id buckets: about this many lines each
-constexpr size_t kPersonBucketEvents = 16384;  // person buckets: about this many events each
+constexpr size_t kEventBucketLines = 65536;  // event_id buckets: about this many lines each
+constexpr size_t kPersonBucketEvents = 65536;  // person buckets: few enough that staging groups stay in L2
 
 #pragma pack(push, 8)
 // Click times relative to the click window start: 32 bits when events pack in u64.
@@ -308,9 +308,9 @@ struct Pipeline {
     };
     template <class E>
     struct ParseState {
-        Scatter<PersonEvent<E>> ev;  // valid events by person hash
-        Scatter<DedupRec<E>> dd;     // every copy by event_id hash
-        Scatter<PersonClick<E>> ck;  // valid clicks by person hash
+        StagedScatter<PersonEvent<E>> ev;  // valid events by person hash
+        StagedScatter<DedupRec<E>> dd;     // every copy by event_id hash
+        StagedScatter<PersonClick<E>> ck;  // valid clicks by person hash
         PendingEvent<E> pending_ev[kParseDelay];
         PersonClick<E> pending_ck[kParseDelay];
         u64 pending_ck_h[kParseDelay];
@@ -351,7 +351,7 @@ struct Pipeline {
     void flush_event(ParseState<E>& st, size_t i) {
         const PendingEvent<E>& x = st.pending_ev[i];
         Key person = persons.name_select(x.user, x.h);
-        PersonEvent<E>* p = st.ev.push_ptr(size_t(key_hash(person) >> person_shift), PersonEvent<E>{person, x.ev});
+        PersonEvent<E>* p = st.ev.push(size_t(key_hash(person) >> person_shift), PersonEvent<E>{person, x.ev});
         st.dd.push(size_t(key_hash(x.eid) >> event_shift), DedupRec<E>{x.eid, p, x.ingest});
     }
     template <class E>
@@ -524,7 +524,13 @@ struct Pipeline {
                 }
             }
             drain(st);  // nothing may stay pending once the chunk is done
+            store_fence();
         });
+        for (auto& st : parsed) {  // write out every bucket's partial group
+            st.ev.flush();
+            st.dd.flush();
+            st.ck.flush();
+        }
         timer.lap("parse");
         // the records hold keys, not pointers: release the inputs off the critical path
         std::thread([files = std::move(event_files), clicks = std::move(click_files),
