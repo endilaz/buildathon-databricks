@@ -27,23 +27,23 @@ run_env() {  # name env binary
   printf "%-6s wall=%5sms  " "$1" $(( (e-s)/1000000 ))
   awk '/ms\]/{printf "%s=%s ", $4, $5} /^time:/{printf " %s %s %s %s", $2, $3, $4, $5}' /tmp/log; echo
 }
-echo "== THP=madvise NCPU=$NC (base = ${BASE:-base}, new = this branch; pread is its default, mmap via SHOPPING_MMAP=1)" >> "$OUT"
+echo "== THP=madvise NCPU=$NC: main=0e598b9, single=519adf7 (unstaged), staged=this branch (pread default; mmap via SHOPPING_MMAP=1)" >> "$OUT"
 for i in 1 2 3 4 5 6 7 8; do
-  run_env base "X=1" ./basebin >> "$OUT"
-  run_env pread "X=1" ./ours >> "$OUT"
-  run_env mmap "SHOPPING_MMAP=1" ./ours >> "$OUT"
+  run_env main "X=1" ./bin-0e598b9 >> "$OUT"
+  run_env single "X=1" ./bin-519adf7 >> "$OUT"
+  run_env staged "X=1" ./ours >> "$OUT"
+  run_env stagmm "SHOPPING_MMAP=1" ./ours >> "$OUT"
 done
-echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled > /dev/null
 # hardware counters and profiles (may be unavailable in the VM)
 sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" > /dev/null 2>&1 || true
 if command -v perf > /dev/null; then
   echo "== perf stat (THP=madvise)" >> "$OUT"
-  for b in ours-g basebin; do
+  for b in ours-g bin-0e598b9; do
     echo "-- $b" >> "$OUT"
     rm -rf /tmp/o; sudo perf stat -e task-clock,cycles,instructions,branch-misses,cache-misses,dTLB-load-misses,page-faults \
       ./$b "$D" /tmp/o 2>&1 >/dev/null | grep -E "task-clock|cycles|instructions|misses|faults|elapsed" >> "$OUT"
   done
-  for b in ours-g basebin; do
+  for b in ours-g bin-0e598b9; do
     rm -rf /tmp/o; sudo perf record -q -F 2000 -g -o /tmp/$b.data ./$b "$D" /tmp/o > /dev/null 2>&1
     sudo perf report -i /tmp/$b.data --no-children --stdio --percent-limit 0.7 -g none 2>/dev/null | grep -v "^#" | grep -v "^$" | cut -c1-200 > perf-$b.txt
   done
