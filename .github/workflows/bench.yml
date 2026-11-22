@@ -34,17 +34,18 @@ jobs:
           T=x86_64-unknown-linux-gnu
           F="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
           RUSTFLAGS="$F" cargo build -q --release --offline --target $T && cp target/$T/release/shopping-sessions ../v-base
-          for f in stage1 nofilter pd16; do
+          for f in stage1 nofilter pd12; do
             RUSTFLAGS="$F" cargo build -q --release --offline --features $f --target $T
             cp target/$T/release/shopping-sessions ../v-$f
           done
-          # Cascade Lake tuning (as the C++ build's -mtune) without AVX-512
-          RUSTFLAGS="-C target-cpu=cascadelake -C target-feature=-avx512f,+crt-static" cargo build -q --release --offline --target $T
-          cp target/$T/release/shopping-sessions ../v-tune
-          objdump -d ../v-tune | grep -cE 'zmm|%k[0-7]' || true
           CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
             RUSTFLAGS="$F -C force-frame-pointers=yes" cargo build -q --release --offline --target $T
           cp target/$T/release/shopping-sessions ../cand-g
+      - name: Build an unstripped C++ copy for profiling
+        run: |
+          sudo apt-get install -y -qq g++ make > /dev/null 2>&1 || true
+          make -s -C wt-main CXX=g++ ARCHFLAGS="-march=x86-64-v3 -mtune=cascadelake" CXXFLAGS="-O3 -DNDEBUG -flto=auto -fno-plt -g -fno-omit-frame-pointer" LDFLAGS=-static BIN=cpp-g
+          cp wt-main/cpp-g ./cpp-g
       - name: Generate 20M events with the official generator
         run: |
           curl -fsSL -o gen.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
