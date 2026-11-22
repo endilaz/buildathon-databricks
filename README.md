@@ -1,6 +1,10 @@
 # Databricks Shopping Sessions
 
-This C++20 pipeline turns raw clickstream CSVs into the two exact daily Parquet tables for the Databricks buildathon track. It is a single static binary on an empty image, with no runtime dependencies. All of its code was written for this event. [Track overview](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions) · [Data specification](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md?inline=1)
+This C++20 pipeline turns raw clickstream CSVs into the two exact daily Parquet tables for the Databricks buildathon track. It is a single static binary on an empty image, with no runtime dependencies. All of its code was written for this event.
+
+The scored entry, built by the root `Dockerfile`, is a Rust port of this pipeline in [`rust/`](rust/README.md). It uses the same algorithms and gives the same output at the same speed. `Dockerfile.cpp` builds the C++ version described below.
+
+[Track overview](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions) · [Data specification](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md?inline=1)
 
 ## Run the scored entry point
 

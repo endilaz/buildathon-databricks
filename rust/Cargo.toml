@@ -1,0 +1,22 @@
+[package]
+name = "shopping-sessions"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Databricks Shopping Sessions pipeline (Rust port of the C++ entry)"
+publish = false
+
+[[bin]]
+name = "shopping-sessions"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true
+
+[features]
+collide = []  # tests: few long-ID key bits, so long IDs collide
