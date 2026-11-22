@@ -11,9 +11,10 @@
 namespace ss {
 
 struct Input {
-    const char* data = nullptr;
+    const char* data = nullptr;  // mapped bytes, or null for a file read with pread
     size_t len = 0;
     size_t mapped = 0;
+    int fd = -1;  // open for pread (opened, not mapped)
 };
 
 inline size_t page_size() {
@@ -37,6 +38,30 @@ inline Input map_input(const std::string& path) {
     }
     close(fd);
     return {static_cast<const char*>(base), len, total};
+}
+
+// Opens a file for pread without mapping it.
+inline Input open_input(const std::string& path) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) die("cannot open %s", path.c_str());
+    struct stat st{};
+    if (fstat(fd, &st) != 0) die("cannot stat %s", path.c_str());
+    Input in;
+    in.len = size_t(st.st_size);
+    in.fd = fd;
+    return in;
+}
+
+// Reads [from, to) of a file opened with open_input into buf (which must
+// hold to - from + 64 bytes); the 64 bytes after the data are zeroed.
+inline void read_range(const Input& in, size_t from, size_t to, char* buf) {
+    size_t done = 0, want = to - from;
+    while (done < want) {
+        ssize_t r = pread(in.fd, buf + done, want - done, off_t(from + done));
+        if (r <= 0) die("cannot read input (%zd)", r);
+        done += size_t(r);
+    }
+    std::memset(buf + want, 0, 64);
 }
 
 inline void unmap_input(const Input& in) {
@@ -208,6 +233,14 @@ public:
         Cursor& c = cursors_[i];
         if (c.fill == kBlock) [[unlikely]] grow(i);
         c.cur[c.fill++] = x;
+    }
+    // As push, returning where x now lies (blocks never move).
+    inline T* push_ptr(size_t i, const T& x) {
+        Cursor& c = cursors_[i];
+        if (c.fill == kBlock) [[unlikely]] grow(i);
+        T* p = c.cur + c.fill++;
+        *p = x;
+        return p;
     }
     size_t size(size_t i) const {
         size_t n = blocks_[i].size();

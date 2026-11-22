@@ -1,9 +1,11 @@
 // Shopping Sessions pipeline.
 //
-//   links    parse in parallel; union-find on a helper thread during the parse
-//   parse    one pass over events and clicks; events scatter by event_id hash
-//   dedup    per event_id bucket: earliest ingest wins, then valid survivors
-//            and clicks scatter by person hash
+//   links    parse in parallel; the persons map is built in parallel
+//   parse    one pass over events and clicks: each valid event and click is
+//            resolved to its person and filed in that person's bucket; every
+//            copy of an event also leaves a small record by event_id
+//   dedup    per event_id bucket: the earliest ingest wins, and every other
+//            copy's filed event is marked dropped where it lies
 //   sessions per person bucket: group by person, sessions, credit, assists
 //   output   hand-written Parquet, one user_daily file per worker
 #include "parquet.hpp"
@@ -17,30 +19,23 @@
 namespace ss {
 namespace {
 
-constexpr int kPrefetch = 32;               // person lookups issued this many records ahead
 constexpr size_t kEventBucketLines = 32768;  // event_id buckets: about this many lines each
 constexpr size_t kPersonBucketEvents = 16384;  // person buckets: about this many events each
 
 #pragma pack(push, 8)
-template <class E>
-struct EventRec {  // one parsed event line: the event packed as kept, or all ones when invalid
-    Key eid, user;
-    i64 ingest;
-    E ev;
-};
 // Click times relative to the click window start: 32 bits when events pack in u64.
 template <class E>
 using Rel = std::conditional_t<std::is_same_v<E, u64>, u32, u64>;
 template <class E>
-struct ClickRec {
-    Key cid, user;
-    Rel<E> rel;
-    u32 camp;
-};
-template <class E>
-struct PersonEvent {
+struct PersonEvent {  // a valid event, filed under its person; ev is all ones once dedup drops it
     Key person;
     E ev;
+};
+template <class E>
+struct DedupRec {  // every parsed copy of an event, by event_id
+    Key eid;
+    PersonEvent<E>* ev;  // where its event was filed; null when the copy is invalid
+    i64 ingest;
 };
 template <class E>
 struct PersonClick {
@@ -49,8 +44,7 @@ struct PersonClick {
     u32 camp;
 };
 #pragma pack(pop)
-static_assert(sizeof(EventRec<u64>) == 48 && sizeof(ClickRec<u64>) == 40 && sizeof(PersonClick<u64>) == 40 &&
-              sizeof(PersonEvent<u64>) == 24);
+static_assert(sizeof(DedupRec<u64>) == 32 && sizeof(PersonClick<u64>) == 40 && sizeof(PersonEvent<u64>) == 24);
 
 // ---------------------------------------------------------------- catalog
 
@@ -151,6 +145,16 @@ struct Persons {
         }
     }
     Key name(Key user) const { return name_hashed(user, key_hash(user)); }
+    // Linked or not is a coin toss from line to line: the first slot's answer
+    // is selected, not branched on; only a collision walks on.
+    Key name_select(Key user, u64 h) const {
+        size_t i = slot(h);
+        const auto& s = slots[i];
+        Key k = s.k;
+        Key hit = s.v;
+        if ((k != user) & (k != 0)) [[unlikely]] return name_hashed(user, h);
+        return k == user ? hit : user;
+    }
     // h must be key_hash(user)
     Key name_hashed(Key user, u64 h) const {
         for (size_t i = slot(h);; i = next(i)) {
@@ -291,14 +295,32 @@ struct Pipeline {
     Catalog* catalog = nullptr;
     std::vector<Input> link_files, event_files, click_files;
 
+    // Person lookups during the parse run this many lines after their
+    // prefetch, so each (DRAM) miss overlaps the parsing of the lines between.
+    static constexpr size_t kReadPiece = size_t(256) << 10;
+    static constexpr size_t kParseDelay = 16;
+    template <class E>
+    struct PendingEvent {
+        Key eid, user;
+        i64 ingest;
+        E ev;
+        u64 h;  // key_hash(user)
+    };
     template <class E>
     struct ParseState {
-        Scatter<EventRec<E>> ev;
-        Scatter<ClickRec<E>> ck{1};
-        explicit ParseState(size_t buckets) : ev(buckets) {}
+        Scatter<PersonEvent<E>> ev;  // valid events by person hash
+        Scatter<DedupRec<E>> dd;     // every copy by event_id hash
+        Scatter<PersonClick<E>> ck;  // valid clicks by person hash
+        PendingEvent<E> pending_ev[kParseDelay];
+        PersonClick<E> pending_ck[kParseDelay];
+        u64 pending_ck_h[kParseDelay];
+        size_t nev = 0, nck = 0;
+        std::vector<char> buf;  // the chunk being parsed, when inputs are read rather than mapped
+        ParseState(size_t event_buckets, size_t person_buckets)
+            : ev(person_buckets), dd(event_buckets), ck(person_buckets) {}
     };
-    size_t event_buckets = 0;
-    u32 event_shift = 0;
+    size_t event_buckets = 0, person_buckets = 0;
+    u32 event_shift = 0, person_shift = 0;
     Persons persons;
 
     Pipeline(std::string d, std::string o, size_t t, bool profile)
@@ -326,11 +348,31 @@ struct Pipeline {
     }
 
     template <class E>
-    void parse_event(Field (&f)[7], Scatter<EventRec<E>>& out) {
+    void flush_event(ParseState<E>& st, size_t i) {
+        const PendingEvent<E>& x = st.pending_ev[i];
+        Key person = persons.name_select(x.user, x.h);
+        PersonEvent<E>* p = st.ev.push_ptr(size_t(key_hash(person) >> person_shift), PersonEvent<E>{person, x.ev});
+        st.dd.push(size_t(key_hash(x.eid) >> event_shift), DedupRec<E>{x.eid, p, x.ingest});
+    }
+    template <class E>
+    void flush_click(ParseState<E>& st, size_t i) {
+        PersonClick<E>& c = st.pending_ck[i];
+        c.person = persons.name_select(c.person, st.pending_ck_h[i]);
+        st.ck.push(size_t(key_hash(c.person) >> person_shift), c);
+    }
+    template <class E>
+    void drain(ParseState<E>& st) {
+        for (size_t i = st.nev > kParseDelay ? st.nev - kParseDelay : 0; i < st.nev; ++i) flush_event(st, i % kParseDelay);
+        for (size_t i = st.nck > kParseDelay ? st.nck - kParseDelay : 0; i < st.nck; ++i) flush_click(st, i % kParseDelay);
+        st.nev = st.nck = 0;
+    }
+
+    template <class E>
+    void parse_event(Field (&f)[7], ParseState<E>& st) {
         if (f[0].empty()) return;
         i64 ingest;
         if (!parse_f1(f[3], ingest)) return;
-        EventRec<E> r{make_key(f[0]), 0, ingest, ~E(0)};
+        Key eid = make_key(f[0]);
         i64 ts;
         if (!f[1].empty() && !f[5].empty() && parse_ts(f[2], ts) && ts >= w.start && ts < w.end &&
             ingest - ts <= kDay) {
@@ -348,21 +390,35 @@ struct Pipeline {
             if (ok) {
                 // only purchases need a category: top_category sums purchase prices
                 u32 cat = price ? catalog->category(f[5]) : 0;
-                r.user = make_key(f[1]);
-                r.ev = Pack<E>::event(u64(ts - w.start), cat, price);
+                Key user = make_key(f[1]);
+                u64 h = key_hash(user);
+                persons.prefetch_hashed(h);
+                size_t i = st.nev % kParseDelay;
+                if (st.nev >= kParseDelay) flush_event(st, i);
+                st.pending_ev[i] = PendingEvent<E>{eid, user, ingest, Pack<E>::event(u64(ts - w.start), cat, price), h};
+                ++st.nev;
+                return;
             }
         }
-        out.push(size_t(key_hash(r.eid) >> event_shift), r);
+        // an invalid copy files no event, but can still be the earliest copy
+        st.dd.push(size_t(key_hash(eid) >> event_shift), DedupRec<E>{eid, nullptr, ingest});
     }
 
     template <class E>
-    void parse_click(Field (&f)[4], Scatter<ClickRec<E>>& out) {
+    void parse_click(Field (&f)[4], ParseState<E>& st) {
         if (f[0].empty() || f[1].empty() || f[2].empty()) return;
         const u32* camp = catalog->campaigns.find(make_key(f[2]));
         if (!camp) return;
         i64 ts;
         if (!parse_ts(f[3], ts) || ts < w.click_start || ts >= w.end) return;
-        out.push(0, ClickRec<E>{make_key(f[0]), make_key(f[1]), Rel<E>(ts - w.click_start), *camp});
+        Key user = make_key(f[1]);
+        u64 h = key_hash(user);
+        persons.prefetch_hashed(h);
+        size_t i = st.nck % kParseDelay;
+        if (st.nck >= kParseDelay) flush_click(st, i);
+        st.pending_ck[i] = PersonClick<E>{user, make_key(f[0]), Rel<E>(ts - w.click_start), *camp};
+        st.pending_ck_h[i] = h;
+        ++st.nck;
     }
 
     void run() {
@@ -374,8 +430,16 @@ struct Pipeline {
             return v;
         };
         link_files = map_dir("links");
-        event_files = map_dir("events");
-        click_files = map_dir("clicks");
+        // events and clicks are read with pread in L2-sized pieces (on a VM that
+        // can beat faulting and walking 4 KB file pages); SHOPPING_MMAP=1 maps them
+        auto open_dir = [&](const char* name) {
+            std::vector<Input> v;
+            for (auto& p : csv_files(data_dir + "/" + name)) v.push_back(open_input(p));
+            return v;
+        };
+        bool mapped = std::getenv("SHOPPING_MMAP") != nullptr;
+        event_files = mapped ? map_dir("events") : open_dir("events");
+        click_files = mapped ? map_dir("clicks") : open_dir("clicks");
         size_t ev_bytes = 0, ck_bytes = 0;
         for (auto& f : event_files) ev_bytes += f.len;
         for (auto& f : click_files) ck_bytes += f.len;
@@ -413,6 +477,8 @@ struct Pipeline {
         size_t est_lines = ev_bytes / 72 + 1;
         event_buckets = std::clamp<size_t>(pow2_at_least(est_lines / kEventBucketLines), 16, 4096);
         event_shift = 64 - log2_exact(event_buckets);
+        person_buckets = std::clamp<size_t>(pow2_at_least(est_lines / kPersonBucketEvents), 16, 8192);
+        person_shift = 64 - log2_exact(person_buckets);
         plan_chunks(event_files, size_t(4) << 20, chunks);
         size_t event_chunks = chunks.size();
         plan_chunks(click_files, size_t(4) << 20, chunks);
@@ -426,14 +492,38 @@ struct Pipeline {
         }
         std::vector<ParseState<E>> parsed;
         parsed.reserve(threads);
-        for (size_t t = 0; t < threads; ++t) parsed.emplace_back(event_buckets);
+        for (size_t t = 0; t < threads; ++t) parsed.emplace_back(event_buckets, person_buckets);
         run_tasks(parsed, chunks.size(), [&](ParseState<E>& st, size_t i) {
             auto& c = chunks[i];
-            populate(*c.in, c.s, c.e + 4096);
-            if (i < event_chunks)
-                for_lines<7>(*c.in, c.s, c.e, [&](Field (&f)[7]) { parse_event<E>(f, st.ev); });
-            else
-                for_lines<4>(*c.in, c.s, c.e, [&](Field (&f)[4]) { parse_click<E>(f, st.ck); });
+            auto parse_range = [&](const Input& in, size_t s, size_t e) {
+                if (i < event_chunks)
+                    for_lines<7>(in, s, e, [&](Field (&f)[7]) { parse_event<E>(f, st); });
+                else
+                    for_lines<4>(in, s, e, [&](Field (&f)[4]) { parse_click<E>(f, st); });
+            };
+            if (c.in->data) {
+                populate(*c.in, c.s, c.e + 4096);
+                parse_range(*c.in, c.s, c.e);
+            } else {
+                // Read in pieces small enough to stay in L2 while parsed. A piece
+                // is read from one byte before it (to see whether it starts a
+                // line) through the end of the line that crosses its end.
+                const Input& file = *c.in;
+                for (size_t ps = c.s; ps < c.e; ps += kReadPiece) {
+                    size_t pe = std::min(c.e, ps + kReadPiece);
+                    size_t from = ps ? ps - 1 : 0, to = std::min(file.len, pe + 4096);
+                    for (;;) {
+                        size_t need = to - from + 64;
+                        if (st.buf.size() < need) st.buf.resize(need);
+                        read_range(file, from, to, st.buf.data());
+                        size_t tail = pe - from - 1;  // the piece's last byte, in buf
+                        if (to == file.len || std::memchr(st.buf.data() + tail, '\n', to - from - tail)) break;
+                        to = std::min(file.len, to + (to - from));  // a very long line: read more
+                    }
+                    parse_range(Input{st.buf.data(), to - from, 0, -1}, ps - from, pe - from);
+                }
+            }
+            drain(st);  // nothing may stay pending once the chunk is done
         });
         timer.lap("parse");
         // the records hold keys, not pointers: release the inputs off the critical path
@@ -449,115 +539,57 @@ struct Pipeline {
     template <class E>
     void finish(std::vector<ParseState<E>>& parsed) {
         using P = Pack<E>;
-        // ---- dedup events, map events and clicks to persons, scatter by person
-        size_t total_events = 0;
-        for (auto& p : parsed)
-            for (size_t b = 0; b < event_buckets; ++b) total_events += p.ev.size(b);
-        size_t person_buckets = std::clamp<size_t>(pow2_at_least(total_events / kPersonBucketEvents), 16, 8192);
-        u32 person_shift = 64 - log2_exact(person_buckets);
-        constexpr size_t kClickTaskBlocks = 256;
-        std::vector<std::pair<size_t, size_t>> click_tasks;  // (thread, first block)
-        for (size_t t = 0; t < parsed.size(); ++t)
-            for (size_t j = 0; j < parsed[t].ck.num_blocks(0); j += kClickTaskBlocks) click_tasks.emplace_back(t, j);
-
+        // ---- dedup: per event_id bucket the earliest copy wins; every other
+        // copy's filed event (if it has one) is dropped where it lies
         struct DedupState {
-            Scatter<PersonEvent<E>> ev;
-            Scatter<PersonClick<E>> ck;
-            std::vector<u64> table, wins;
-            std::vector<const EventRec<E>*> blocks;
-            explicit DedupState(size_t n) : ev(n), ck(n) {}
+            std::vector<u64> table;
+            std::vector<const DedupRec<E>*> blocks;
+            std::vector<u32> lens;
         };
-        std::vector<DedupState> dedup;
-        dedup.reserve(threads);
-        for (size_t t = 0; t < threads; ++t) dedup.emplace_back(person_buckets);
-        run_tasks(dedup, event_buckets + click_tasks.size(), [&](DedupState& st, size_t task) {
-            if (task < event_buckets) {
-                size_t b = task;
-                st.blocks.clear();
-                size_t n = 0;
-                for (auto& p : parsed) {
-                    for (size_t j = 0; j < p.ev.num_blocks(b); ++j) st.blocks.push_back(p.ev.block(b, j).first);
-                    n += p.ev.size(b);
+        std::vector<DedupState> dedup(threads);
+        run_tasks(dedup, event_buckets, [&](DedupState& st, size_t b) {
+            st.blocks.clear();
+            st.lens.clear();
+            size_t n = 0;
+            for (auto& p : parsed) {
+                for (size_t j = 0; j < p.dd.num_blocks(b); ++j) {
+                    auto [blk, len] = p.dd.block(b, j);
+                    st.blocks.push_back(blk);
+                    st.lens.push_back(len);
                 }
-                if (!n) return;
-                // block lengths: every block is full except each thread's last
-                std::vector<u32> lens;
-                lens.reserve(st.blocks.size());
-                for (auto& p : parsed)
-                    for (size_t j = 0; j < p.ev.num_blocks(b); ++j) lens.push_back(p.ev.block(b, j).second);
-                size_t cap = pow2_at_least(2 * n), mask = cap - 1;
-                st.table.assign(cap, 0);
-                st.wins.assign((st.blocks.size() * Scatter<EventRec<E>>::kBlock + 63) / 64, 0);
-                auto rec = [&](u64 ref) -> const EventRec<E>& { return st.blocks[ref >> 7][ref & 127]; };
-                for (size_t bi = 0; bi < st.blocks.size(); ++bi) {
-                    const EventRec<E>* blk = st.blocks[bi];
-                    for (u32 i = 0; i < lens[bi]; ++i) {
-                        const EventRec<E>& r = blk[i];
-                        u64 ref = (u64(bi) << 7) | i;
-                        u64 h = key_hash(r.eid);
-                        u64 tag = h >> 32;
-                        u64 entry = (tag << 32) | (ref + 1);
-                        u64 valid = r.ev != ~E(0);
-                        for (size_t s = h & mask;; s = (s + 1) & mask) {
-                            u64 cur = st.table[s];
-                            if (!cur) {
-                                st.table[s] = entry;
-                                st.wins[ref >> 6] |= valid << (ref & 63);
+                n += p.dd.size(b);
+            }
+            if (!n) return;
+            size_t cap = pow2_at_least(2 * n), mask = cap - 1;
+            st.table.assign(cap, 0);
+            auto rec = [&](u64 ref) -> const DedupRec<E>& { return st.blocks[ref >> 7][ref & 127]; };
+            const E dropped = ~E(0);
+            for (size_t bi = 0; bi < st.blocks.size(); ++bi) {
+                const DedupRec<E>* blk = st.blocks[bi];
+                for (u32 i = 0; i < st.lens[bi]; ++i) {
+                    const DedupRec<E>& r = blk[i];
+                    u64 ref = (u64(bi) << 7) | i;
+                    u64 h = key_hash(r.eid);
+                    u64 tag = h >> 32;
+                    u64 entry = (tag << 32) | (ref + 1);
+                    for (size_t s = h & mask;; s = (s + 1) & mask) {
+                        u64 cur = st.table[s];
+                        if (!cur) {
+                            st.table[s] = entry;
+                            break;
+                        }
+                        if ((cur >> 32) == tag) {
+                            const DedupRec<E>& o = rec((cur & 0xFFFFFFFFu) - 1);
+                            if (o.eid == r.eid) {
+                                if (r.ingest < o.ingest) {  // the new copy wins
+                                    st.table[s] = entry;
+                                    if (o.ev) o.ev->ev = dropped;
+                                } else if (r.ev) {
+                                    r.ev->ev = dropped;
+                                }
                                 break;
                             }
-                            if ((cur >> 32) == tag) {
-                                u64 old = (cur & 0xFFFFFFFFu) - 1;
-                                const EventRec<E>& o = rec(old);
-                                if (o.eid == r.eid) {
-                                    if (r.ingest < o.ingest) {
-                                        st.table[s] = entry;
-                                        st.wins[old >> 6] &= ~(u64(1) << (old & 63));
-                                        st.wins[ref >> 6] |= valid << (ref & 63);
-                                    }
-                                    break;
-                                }
-                            }
                         }
-                    }
-                }
-                // survivors in memory order; person lookups prefetched ahead
-                struct Pending {
-                    Key user;
-                    E ev;
-                    u64 h;  // key_hash(user)
-                };
-                Pending ring[kPrefetch];
-                size_t count = 0;
-                auto emit = [&](const Pending& x) {
-                    Key person = persons.name_hashed(x.user, x.h);
-                    st.ev.push(size_t(key_hash(person) >> person_shift), PersonEvent<E>{person, x.ev});
-                };
-                for (size_t wi = 0; wi < st.wins.size(); ++wi) {
-                    for (u64 bits = st.wins[wi]; bits; bits &= bits - 1) {
-                        const EventRec<E>& r = rec((u64(wi) << 6) | u64(__builtin_ctzll(bits)));
-                        Pending x{r.user, r.ev, key_hash(r.user)};
-                        persons.prefetch_hashed(x.h);
-                        if (count >= kPrefetch) emit(ring[count % kPrefetch]);
-                        ring[count % kPrefetch] = x;
-                        ++count;
-                    }
-                }
-                for (size_t i = count > kPrefetch ? count - kPrefetch : 0; i < count; ++i) emit(ring[i % kPrefetch]);
-                // this task was bucket b's only reader: its (faulted-in) blocks take the next pushes
-                for (auto& p : parsed) p.ev.recycle_bucket(b, st.ev.arena());
-            } else {
-                st.ck.arena().take_free(st.ev.arena());  // event tasks all come first
-                auto [t, first] = click_tasks[task - event_buckets];
-                auto& src = parsed[t].ck;
-                size_t last = std::min(src.num_blocks(0), first + kClickTaskBlocks);
-                for (size_t j = first; j < last; ++j) {
-                    auto [blk, len] = src.block(0, j);
-                    for (u32 i = 0; i < len && i < kPrefetch; ++i) persons.prefetch_user(blk[i].user);
-                    for (u32 i = 0; i < len; ++i) {
-                        if (i + kPrefetch < len) persons.prefetch_user(blk[i + kPrefetch].user);
-                        const ClickRec<E>& c = blk[i];
-                        Key person = persons.name(c.user);
-                        st.ck.push(size_t(key_hash(person) >> person_shift), PersonClick<E>{person, c.cid, c.rel, c.camp});
                     }
                 }
             }
@@ -570,7 +602,7 @@ struct Pipeline {
         std::vector<std::pair<size_t, u32>> order(person_buckets);
         for (size_t p = 0; p < person_buckets; ++p) {
             size_t n = 0;
-            for (auto& d : dedup) n += d.ev.size(p) + d.ck.size(p);
+            for (auto& d : parsed) n += d.ev.size(p) + d.ck.size(p);
             order[p] = {n, u32(p)};
         }
         std::sort(order.begin(), order.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -586,7 +618,7 @@ struct Pipeline {
         std::vector<SessionState> sess;
         sess.reserve(threads);
         size_t kept = 0;
-        for (auto& d : dedup)
+        for (auto& d : parsed)
             for (size_t p = 0; p < person_buckets; ++p) kept += d.ev.size(p);
         for (size_t t = 0; t < threads; ++t) {
             sess.emplace_back(w, ncamp, ncat);
@@ -596,7 +628,7 @@ struct Pipeline {
         run_tasks(sess, person_buckets, [&](SessionState& st, size_t task) {
             size_t p = order[task].second;
             size_t n = 0;
-            for (auto& d : dedup) n += d.ev.size(p);
+            for (auto& d : parsed) n += d.ev.size(p);
             if (!n) return;
             st.local.reset(n / 48 + 16);
             st.names.clear();
@@ -605,8 +637,10 @@ struct Pipeline {
             st.lids.resize(n);
             size_t k = 0;
             u64 max_hi = 0;
-            for (auto& d : dedup) {
+            const E dropped = ~E(0);
+            for (auto& d : parsed) {
                 d.ev.for_each(p, [&](const PersonEvent<E>& e) {
+                    if (e.ev == dropped) return;  // a later copy of an event (dedup)
                     // records are packed to 8 bytes: copy keys out before taking
                     // references (a Key& assumes 16-byte alignment)
                     const Key person = e.person;
@@ -621,6 +655,10 @@ struct Pipeline {
                     max_hi = std::max(max_hi, P::hi(e.ev));
                 });
             }
+            n = k;  // copies dropped by dedup are gone
+            st.raw.resize(n);
+            st.lids.resize(n);
+            if (!n) return;
             // the whole bucket in time order; the stable placement keeps it per person
             radix_by_time<E>(st.raw, st.lids, st.tmp, st.tmp_lids, max_hi, st.hist);
             const size_t people = st.names.size();
@@ -635,7 +673,7 @@ struct Pipeline {
             st.raw_cids.clear();
             st.raw_camps.clear();
             max_hi = 0;
-            for (auto& d : dedup) {
+            for (auto& d : parsed) {
                 d.ck.for_each(p, [&](const PersonClick<E>& c) {
                     const u32* lid = st.local.find(c.person);
                     if (!lid) return;
