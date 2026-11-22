@@ -41,4 +41,23 @@ Big allocations come from fresh zero mappings, so `vec![0; n]` does no memset.
 
 The port matches the official seed-1 dev answer for the new ID format in every mode: default, wide, mmap, exact IDs, one thread, the table-full restart and the forced-collision restart. It passes all 36 fixtures in each of those modes, and again through the amd64 image run with the scorer's flags. On generated seeds 2 to 4 (3M events each) and seed 7 (20M), it matches the C++ binary row for row.
 
-On the 20M seed in Docker on an Apple M5 with 8 CPUs, the median run takes about 1.19 s, against 1.21 s for the C++ build in the same interleaved runs.
+## Speed, and what the x86 bench found
+
+The x86 numbers come from `bench-ci`, a GitHub Actions job on 4-vCPU AMD EPYC runners. It times builds interleaved on 20M events from the official generator and posts the results and `perf` profiles to the `bench-results` branch. The Docker VM on the M5 gave much noisier numbers, and some changes behaved differently there.
+
+- Splitting the parse into layers (`--features probe`, `SHOPPING_PROBE=read|scan|fields|keys|resolve`) shows where its time goes. Filing the records takes about 25%, splitting lines 19%, field parsing 15%, the person lookup 13%, ID keys 10% and reading 9%.
+- These changes were kept, each checked on x86:
+  - a cached filter of linked IDs, read without a branch, so unlinked users skip the persons table
+  - sizing the person map for about 20 events per person
+  - Fibonacci hashing in the key map
+  - a 13-digit epoch fast path
+  - a faster long-ID hash
+  - unchecked indexing where the bounds are invariants
+  - building with Rust 1.100, whose output parsed about 6% faster than 1.85's
+- These were measured and dropped:
+  - 128-byte scanner blocks (slower on both machines)
+  - branch-free ID packing (ID lengths are predictable)
+  - mmap instead of pread
+  - one-pass radix sorting (the insertion pass explodes on the big merged persons)
+  - half-size dedup buckets
+- Some choices are cargo features or environment variables, so the bench can compare them without code changes. The features are `scan128`, `smalldd`, `pd16`, `mixhash`, `civilref`, `ddclear` and `stage2`. The variables are `SHOPPING_FBITS`, `SHOPPING_PBE` and `SHOPPING_PIECE`.
