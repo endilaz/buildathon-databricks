@@ -22,18 +22,15 @@ struct Column {
         values.append(s);
     }
     void add_key(Key k) {
-        if (is_long(k)) [[unlikely]] {
+        if (is_interned(k)) [[unlikely]] {
             std::string s;
             append_key(k, s);
             add_string(s);
             return;
         }
-        u32 n = u32(u8(k));
-        char buf[20];
-        u64 hi = __builtin_bswap64(u64(k >> 64)), lo = __builtin_bswap64(u64(k));
+        char buf[16];
+        u32 n = u32(packed_bytes(k, buf + 4));
         std::memcpy(buf, &n, 4);
-        std::memcpy(buf + 4, &hi, 8);
-        std::memcpy(buf + 12, &lo, 8);
         values.append(buf, 4 + n);
     }
     void add_i32(i32 v) { values.append(reinterpret_cast<const char*>(&v), 4); }

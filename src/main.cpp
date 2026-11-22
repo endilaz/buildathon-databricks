@@ -21,7 +21,7 @@ namespace {
 
 constexpr size_t kEventBucketLines = 65536;  // event_id buckets: about this many lines each
 #ifndef SS_PBE
-#define SS_PBE 65536
+#define SS_PBE 32768
 #endif
 constexpr size_t kPersonBucketEvents = SS_PBE;  // person buckets: few enough that staging groups stay in L2
 
@@ -47,7 +47,7 @@ struct PersonClick {
     u32 camp;
 };
 #pragma pack(pop)
-static_assert(sizeof(DedupRec<u64>) == 32 && sizeof(PersonClick<u64>) == 40 && sizeof(PersonEvent<u64>) == 24);
+static_assert(sizeof(DedupRec<u64>) == 24 && sizeof(PersonClick<u64>) == 24 && sizeof(PersonEvent<u64>) == 16);
 
 // ---------------------------------------------------------------- catalog
 
@@ -302,7 +302,7 @@ struct Pipeline {
     // prefetch, so each (DRAM) miss overlaps the parsing of the lines between.
     static constexpr size_t kReadPiece = size_t(256) << 10;
 #ifndef SS_PD
-#define SS_PD 16
+#define SS_PD 12
 #endif
     static constexpr size_t kParseDelay = SS_PD;
     template <class E>

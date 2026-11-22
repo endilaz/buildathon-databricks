@@ -96,6 +96,35 @@ static void product_numbers() {
     }
 }
 
+// Keys: integer order is byte order, equality is string equality, and
+// every key spells its string back, for packed and interned IDs alike.
+static void keys() {
+    const std::string alphabet = "019AZ_az mu\t\r\x01\xff";
+    std::vector<std::string> ids;
+    for (int i = 0; i < 4000; ++i) {
+        size_t n = 1 + rng() % (rng() % 4 ? 10 : 14);
+        std::string s;
+        for (size_t j = 0; j < n; ++j) s.push_back(alphabet[rng() % (rng() % 5 ? 9 : alphabet.size())]);
+        ids.push_back(s);
+    }
+    ids.insert(ids.end(), {"u1", "u10", "u1 ", " u1", "U1", "a", "a_", "aZ", "zzzzzzzzzz", "zzzzzzzzzzz", "0", "_"});
+    std::vector<Key> k;
+    for (auto& s : ids) {
+        std::string b = padded(s);
+        k.push_back(make_key(b.data(), s.size()));
+    }
+    for (size_t i = 0; i < ids.size(); ++i) {
+        std::string back;
+        append_key(k[i], back);
+        CHECK(back == ids[i], "key round trip '%s' -> '%s'", ids[i].c_str(), back.c_str());
+        for (size_t j = i; j < ids.size(); j += 1 + rng() % 7) {
+            CHECK((k[i] == k[j]) == (ids[i] == ids[j]), "key equality '%s' '%s'", ids[i].c_str(), ids[j].c_str());
+            CHECK(key_less(k[i], k[j]) == (ids[i] < ids[j]), "key order '%s' '%s'", ids[i].c_str(), ids[j].c_str());
+            CHECK(key_less(k[j], k[i]) == (ids[j] < ids[i]), "key order '%s' '%s'", ids[j].c_str(), ids[i].c_str());
+        }
+    }
+}
+
 // The scanner against a direct reading of the dialect rules.
 template <int N>
 static bool split_ref(const std::string& line, std::string (&out)[N]) {
@@ -150,6 +179,7 @@ int main() {
     timestamps();
     epoch_digits();
     product_numbers();
+    keys();
     scanner();
     if (failures) {
         std::fprintf(stderr, "%d failures\n", failures);
