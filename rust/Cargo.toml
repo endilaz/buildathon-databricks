@@ -24,7 +24,7 @@ probe = []    # analysis: SHOPPING_PROBE=read|scan|fields|keys stops the parse e
 # x86 bench variants: the other choice for each of these (see the code)
 scan128 = []
 smalldd = []
-pd16 = []
+pd12 = []
 mixhash = []
 civilref = []
 stage1 = []

@@ -240,35 +240,14 @@ impl Persons {
             filter_mask: 63,
         }
     }
-    // At parse time: the slot chosen and prefetched (one stage), or with
-    // stage2 only the filter word prefetched and null returned (the slot is
-    // chosen LOOKUP_STAGE lines later).
-    #[inline(always)]
-    fn first_stage(&self, h: u64) -> *const KeySlot<Key> {
-        if !cfg!(feature = "stage1") {
-            let i = (h >> FILTER_SHIFT) as usize & self.filter_mask;
-            prefetch(unsafe { self.filter.as_ptr().add(i >> 6) });
-            std::ptr::null()
-        } else {
-            let slot = self.lookup_slot(h);
-            prefetch(slot);
-            slot
+    // the hot fields of a lookup, held by value where the parse uses them
+    fn lookup(&self) -> Lookup {
+        Lookup {
+            slots: self.slots.as_ptr(),
+            region_bits: self.region_bits,
+            filter: self.filter.as_ptr(),
+            filter_mask: self.filter_mask,
         }
-    }
-    // The slot a lookup of user (h = key_hash(user)) should read: its first
-    // slot in the table if the filter has its bit, else EMPTY_SLOT.
-    #[inline(always)]
-    fn lookup_slot(&self, h: u64) -> *const KeySlot<Key> {
-        let i = (h >> FILTER_SHIFT) as usize & self.filter_mask;
-        let flagged = (unsafe { *self.filter.get_unchecked(i >> 6) } >> (i & 63)) & 1;
-        let real = unsafe { self.slots.as_ptr().add(region_slot(self.region_bits, h)) } as usize;
-        #[cfg(feature = "nofilter")]
-        return {
-            let _ = flagged;
-            real as *const KeySlot<Key>
-        };
-        let empty = &EMPTY_SLOT as *const KeySlot<Key> as usize;
-        (empty ^ ((real ^ empty) & (flagged as usize).wrapping_neg())) as *const KeySlot<Key>
     }
     // As name_select, reading the slot lookup_slot chose (only a real slot
     // can hold another key, so EMPTY_SLOT never walks).
@@ -313,6 +292,51 @@ impl Persons {
     #[inline(always)]
     fn prefetch_hashed(&self, h: u64) {
         prefetch(unsafe { self.slots.as_ptr().add(region_slot(self.region_bits, h)) });
+    }
+}
+
+// What a person lookup during the parse reads, copied out of Persons so
+// that no step goes through a pointer to it (one fewer dependent load per
+// lookup than reading Persons' vectors).
+#[derive(Clone, Copy)]
+struct Lookup {
+    slots: *const KeySlot<Key>,
+    region_bits: u32,
+    filter: *const u64,
+    filter_mask: usize,
+}
+unsafe impl Send for Lookup {}
+unsafe impl Sync for Lookup {}
+impl Lookup {
+    // At parse time: the slot chosen and prefetched (one stage), or with
+    // stage2 only the filter word prefetched and null returned (the slot is
+    // chosen LOOKUP_STAGE lines later).
+    #[inline(always)]
+    fn first_stage(&self, h: u64) -> *const KeySlot<Key> {
+        if !cfg!(feature = "stage1") {
+            let i = (h >> FILTER_SHIFT) as usize & self.filter_mask;
+            prefetch(unsafe { self.filter.add(i >> 6) });
+            std::ptr::null()
+        } else {
+            let slot = self.lookup_slot(h);
+            prefetch(slot);
+            slot
+        }
+    }
+    // The slot a lookup of user (h = key_hash(user)) should read: its first
+    // slot in the table if the filter has its bit, else EMPTY_SLOT.
+    #[inline(always)]
+    fn lookup_slot(&self, h: u64) -> *const KeySlot<Key> {
+        let i = (h >> FILTER_SHIFT) as usize & self.filter_mask;
+        let flagged = (unsafe { *self.filter.add(i >> 6) } >> (i & 63)) & 1;
+        let real = unsafe { self.slots.add(region_slot(self.region_bits, h)) } as usize;
+        #[cfg(feature = "nofilter")]
+        return {
+            let _ = flagged;
+            real as *const KeySlot<Key>
+        };
+        let empty = &EMPTY_SLOT as *const KeySlot<Key> as usize;
+        (empty ^ ((real ^ empty) & (flagged as usize).wrapping_neg())) as *const KeySlot<Key>
     }
 }
 
@@ -554,9 +578,11 @@ fn restart(var: &str, val: &str) -> ! {
 // the M5, whose L2 holds the filter).
 // pread pieces (SHOPPING_PIECE overrides, for sweeps)
 const READ_PIECE: usize = 256 << 10;
-#[cfg(not(feature = "pd16"))]
+// 16 (a power of two: the ring index is a mask, where % 12 showed as a
+// stall in the Intel profile); feature pd12 for the old delay
+#[cfg(feature = "pd12")]
 const PARSE_DELAY: usize = 12;
-#[cfg(feature = "pd16")]
+#[cfg(not(feature = "pd12"))]
 const PARSE_DELAY: usize = 16;
 const LOOKUP_STAGE: usize = PARSE_DELAY / 2;
 
@@ -634,6 +660,7 @@ struct Ctx<'a> {
     w: Window,
     catalog: &'a Catalog,
     persons: &'a Persons,
+    look: Lookup,
     event_shift: u32,
     person_shift: u32,
 }
@@ -641,9 +668,9 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     #[inline(always)]
     fn flush_event<E: Ev>(&self, st: &mut ParseState<E>, i: usize) {
-        let x = st.pending_ev[i];
+        let x = &st.pending_ev[i];
         // lines drained before their second stage choose the slot now
-        let slot = if x.slot.is_null() { self.persons.lookup_slot(x.h) } else { x.slot };
+        let slot = if x.slot.is_null() { self.look.lookup_slot(x.h) } else { x.slot };
         let (person, linked) = self.persons.name_at(x.user, x.h, slot);
         // a linked ID's bytes were recorded with the links
         #[cfg(feature = "probe")]
@@ -679,7 +706,7 @@ impl Ctx<'_> {
         let (user, cid) = (c.person, c.cid);
         let h = st.pending_ck_h[i];
         let slot = st.pending_ck_slot[i];
-        let slot = if slot.is_null() { self.persons.lookup_slot(h) } else { slot };
+        let slot = if slot.is_null() { self.look.lookup_slot(h) } else { slot };
         let (person, linked) = self.persons.name_at(user, h, slot);
         c.person = person;
         if is_long(user) && !linked {
@@ -738,7 +765,7 @@ impl Ctx<'_> {
                         let mut check = 0u16;
                         let user = make_key_check(f[1].bytes(), &mut check);
                         let h = key_hash(user);
-                        let first = self.persons.first_stage(h);
+                        let first = self.look.first_stage(h);
                         if is_long(user) {
                             prefetch_long(user);
                         }
@@ -748,7 +775,7 @@ impl Ctx<'_> {
                         }
                         if !cfg!(feature = "stage1") && st.nev >= LOOKUP_STAGE {
                             let j = (st.nev - LOOKUP_STAGE) % PARSE_DELAY;
-                            let slot = self.persons.lookup_slot(st.pending_ev[j].h);
+                            let slot = self.look.lookup_slot(st.pending_ev[j].h);
                             prefetch(slot);
                             st.pending_ev[j].slot = slot;
                         }
@@ -793,7 +820,7 @@ impl Ctx<'_> {
         let user = make_key_check(f[1].bytes(), &mut ucheck);
         let cid = make_key_check(f[0].bytes(), &mut ccheck);
         let h = key_hash(user);
-        let first = self.persons.first_stage(h);
+        let first = self.look.first_stage(h);
         if is_long(user) {
             prefetch_long(user);
         }
@@ -806,7 +833,7 @@ impl Ctx<'_> {
         }
         if !cfg!(feature = "stage1") && st.nck >= LOOKUP_STAGE {
             let j = (st.nck - LOOKUP_STAGE) % PARSE_DELAY;
-            let slot = self.persons.lookup_slot(st.pending_ck_h[j]);
+            let slot = self.look.lookup_slot(st.pending_ck_h[j]);
             prefetch(slot);
             st.pending_ck_slot[j] = slot;
         }
@@ -1114,6 +1141,7 @@ impl Pipeline {
             w: self.w,
             catalog,
             persons: &persons,
+            look: persons.lookup(),
             event_shift: 64 - event_buckets.trailing_zeros(),
             person_shift: 64 - person_buckets.trailing_zeros(),
         };
