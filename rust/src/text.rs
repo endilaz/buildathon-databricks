@@ -68,13 +68,12 @@ unsafe fn block_masks(p: *const u8) -> Masks {
 // Walks data[0, len) from a line start. The end of the data acts as a
 // newline. A field is well formed when it has no quotes, or is wrapped in
 // one pair with none inside; a per-line quote count checks the latter.
-// Masks cover 128 bytes (two blocks) per refill: a refill comes at a point
-// in the line the branch predictor cannot learn, so halving refills halves
-// those mispredictions (marginally slower on arm64; kept for x86, where the
-// masks are cheaper and mispredictions dearer). Feature scan64: one block.
-#[cfg(not(feature = "scan64"))]
+// One 64-byte block per refill. Feature scan128 masks two blocks per refill
+// (half the refills, whose branch mispredicts), but its u128 shifts and bit
+// counts cost more: 141 ms of parse on the x86 bench, slower on arm64 too.
+#[cfg(feature = "scan128")]
 type Mask = u128;
-#[cfg(feature = "scan64")]
+#[cfg(not(feature = "scan128"))]
 type Mask = u64;
 const SPAN: usize = Mask::BITS as usize;
 
@@ -95,7 +94,7 @@ impl Scanner {
         let left = self.len - self.base;
         let a = unsafe { block_masks(self.d.add(self.base)) };
         let (mut nl, mut sep, mut quote) = (a.nl as Mask, a.sep as Mask, a.quote as Mask);
-        #[cfg(not(feature = "scan64"))]
+        #[cfg(feature = "scan128")]
         {
             // the second block only while it starts inside the data (the
             // padding covers 64 bytes past the end, not 128)
@@ -226,6 +225,7 @@ const HIGH_BITS: u64 = 0x8080808080808080;
 fn digits_ok(x: u64, mask: u64) -> bool {
     ((x | x.wrapping_add(0x7676767676767676)) & mask) == 0
 }
+#[cfg_attr(not(test), allow(dead_code))] // the test reference parser's
 #[inline(always)]
 fn byte_at(x: u64, i: u32) -> u32 {
     ((x >> (8 * i)) & 0xFF) as u32
@@ -297,6 +297,56 @@ unsafe fn parse_civil(p: *const u8) -> Option<i64> {
         days = days_from_civil(year as i64, month as i64, day as i64);
     }
     Some(days * DAY + ((hour * 60 + minute) * 60 + second) as i64 * SECOND)
+}
+
+// The byte-wise parser: the test reference, and the civilref bench feature.
+#[cfg(any(test, feature = "civilref"))]
+unsafe fn parse_civil_ref(p: *const u8) -> Option<i64> {
+    // little-endian loads: byte i of a word is p[offset + i]
+    let a = load64(p); // Y Y Y Y - M M -
+    let b = load64(p.add(8)); // D D T H H : M M
+    let c = load64(p.add(16)) & 0xFFFFFF; // : S S
+    let seps = (a & 0xFF0000FF00000000) == 0x2D00002D00000000 // '-' at 4 and 7
+        && (b & 0x0000FF0000FF0000) == 0x00003A0000540000 // 'T' at 2, ':' at 5
+        && (c & 0xFF) == 0x3A; // ':'
+    let xa = a ^ ASCII_ZEROS;
+    let xb = b ^ ASCII_ZEROS;
+    let xc = c ^ 0x303030;
+    if !seps || !digits_ok(xa, 0x0080800080808080) || !digits_ok(xb, 0x8080008080008080) || !digits_ok(xc, 0x808000) {
+        return None;
+    }
+    let year = byte_at(xa, 0) * 1000 + byte_at(xa, 1) * 100 + byte_at(xa, 2) * 10 + byte_at(xa, 3);
+    let month = byte_at(xa, 5) * 10 + byte_at(xa, 6);
+    let day = byte_at(xb, 0) * 10 + byte_at(xb, 1);
+    let hour = byte_at(xb, 3) * 10 + byte_at(xb, 4);
+    let minute = byte_at(xb, 6) * 10 + byte_at(xb, 7);
+    let second = byte_at(xc, 1) * 10 + byte_at(xc, 2);
+    if month.wrapping_sub(1) > 11 || day == 0 || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let days;
+    if year.wrapping_sub(TABLE_YEAR0) < TABLE_YEARS {
+        let i = ((year - TABLE_YEAR0) * 12 + month - 1) as usize;
+        if day > MONTHS.1[i] as u32 {
+            return None;
+        }
+        days = MONTHS.0[i] as i64 + day as i64 - 1;
+    } else {
+        if day > MONTH_DAYS[(month - 1) as usize] as u32 + (month == 2 && is_leap(year)) as u32 {
+            return None;
+        }
+        days = days_from_civil(year as i64, month as i64, day as i64);
+    }
+    Some(days * DAY + hour as i64 * HOUR + minute as i64 * MINUTE + second as i64 * SECOND)
+}
+
+// The parser in use.
+#[inline(always)]
+unsafe fn civil(p: *const u8) -> Option<i64> {
+    #[cfg(feature = "civilref")]
+    return parse_civil_ref(p);
+    #[cfg(not(feature = "civilref"))]
+    parse_civil(p)
 }
 
 // 8 digit values (one per byte, first digit lowest) -> their decimal value.
@@ -388,7 +438,7 @@ pub fn parse_ts(f: Field) -> Option<i64> {
     let n = f.len();
     unsafe {
         if (n == 20 || n == 25) && f.at(4) == b'-' {
-            let t = parse_civil(f.p)?;
+            let t = civil(f.p)?;
             if n == 20 {
                 return if f.at(19) == b'Z' { Some(t) } else { None };
             }
@@ -416,7 +466,7 @@ pub fn parse_ts(f: Field) -> Option<i64> {
 pub fn parse_f1(f: Field) -> Option<i64> {
     unsafe {
         if f.len() == 20 && f.at(19) == b'Z' {
-            parse_civil(f.p)
+            civil(f.p)
         } else {
             None
         }
@@ -452,44 +502,6 @@ mod tests {
     use super::*;
 
     // YYYY-MM-DDTHH:MM:SS at p, in epoch milliseconds.
-    unsafe fn parse_civil_ref(p: *const u8) -> Option<i64> {
-        // little-endian loads: byte i of a word is p[offset + i]
-        let a = load64(p); // Y Y Y Y - M M -
-        let b = load64(p.add(8)); // D D T H H : M M
-        let c = load64(p.add(16)) & 0xFFFFFF; // : S S
-        let seps = (a & 0xFF0000FF00000000) == 0x2D00002D00000000 // '-' at 4 and 7
-            && (b & 0x0000FF0000FF0000) == 0x00003A0000540000 // 'T' at 2, ':' at 5
-            && (c & 0xFF) == 0x3A; // ':'
-        let xa = a ^ ASCII_ZEROS;
-        let xb = b ^ ASCII_ZEROS;
-        let xc = c ^ 0x303030;
-        if !seps || !digits_ok(xa, 0x0080800080808080) || !digits_ok(xb, 0x8080008080008080) || !digits_ok(xc, 0x808000) {
-            return None;
-        }
-        let year = byte_at(xa, 0) * 1000 + byte_at(xa, 1) * 100 + byte_at(xa, 2) * 10 + byte_at(xa, 3);
-        let month = byte_at(xa, 5) * 10 + byte_at(xa, 6);
-        let day = byte_at(xb, 0) * 10 + byte_at(xb, 1);
-        let hour = byte_at(xb, 3) * 10 + byte_at(xb, 4);
-        let minute = byte_at(xb, 6) * 10 + byte_at(xb, 7);
-        let second = byte_at(xc, 1) * 10 + byte_at(xc, 2);
-        if month.wrapping_sub(1) > 11 || day == 0 || hour > 23 || minute > 59 || second > 59 {
-            return None;
-        }
-        let days;
-        if year.wrapping_sub(TABLE_YEAR0) < TABLE_YEARS {
-            let i = ((year - TABLE_YEAR0) * 12 + month - 1) as usize;
-            if day > MONTHS.1[i] as u32 {
-                return None;
-            }
-            days = MONTHS.0[i] as i64 + day as i64 - 1;
-        } else {
-            if day > MONTH_DAYS[(month - 1) as usize] as u32 + (month == 2 && is_leap(year)) as u32 {
-                return None;
-            }
-            days = days_from_civil(year as i64, month as i64, day as i64);
-        }
-        Some(days * DAY + hour as i64 * HOUR + minute as i64 * MINUTE + second as i64 * SECOND)
-    }
 
     // the SWAR parser agrees with the byte-wise one, valid or not
     #[test]

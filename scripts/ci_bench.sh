@@ -20,16 +20,13 @@ run() {  # name env binary
   awk '/ms\]/{printf "%s=%s ", $4, $5} /^time:/{printf " %s %s %s", $2, $3, $4}' /tmp/log; echo
   rm -rf -- "$O"
 }
+echo "host $(cat rustc.txt 2>/dev/null)" >> "$OUT"
 echo "== NCPU=$NC: subm = origin/main image, cand = this branch's image, v-* = host-built variants" >> "$OUT"
 for i in $(seq 1 10); do
   run subm "X=1" ./subm >> "$OUT"
   run cand "X=1" ./cand >> "$OUT"
   run base "X=1" ./v-base >> "$OUT"
-  run scan64 "X=1" ./v-scan64 >> "$OUT"
-  run pd8 "X=1" ./v-pd8 >> "$OUT"
-  run bigdd "X=1" ./v-bigdd >> "$OUT"
-  run nofilt "X=1" ./v-nofilter >> "$OUT"
-  run mmap "SHOPPING_MMAP=1" ./cand >> "$OUT"
+  for f in scan128 smalldd pd16 mixhash civilref ddclear; do run $f "X=1" ./v-$f >> "$OUT"; done
   run cpp "X=1" ./cpp >> "$OUT"
 done
 # outputs of the candidate and the submitted build must agree

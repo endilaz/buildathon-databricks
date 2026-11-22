@@ -2,7 +2,7 @@
 # A static binary on an empty image. x86 builds target AVX2 (x86-64-v3) for
 # the scorer's Xeons; arm64 builds (local testing) use the build machine's
 # CPU. No dependencies, so the build needs no network.
-FROM rust:1.85-slim-bookworm AS build
+FROM rust:1.100.0-slim-bookworm AS build
 WORKDIR /src
 COPY rust/Cargo.toml rust/Cargo.lock ./
 COPY rust/src ./src
