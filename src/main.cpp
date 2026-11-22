@@ -20,7 +20,10 @@ namespace ss {
 namespace {
 
 constexpr size_t kEventBucketLines = 65536;  // event_id buckets: about this many lines each
-constexpr size_t kPersonBucketEvents = 65536;  // person buckets: few enough that staging groups stay in L2
+#ifndef SS_PBE
+#define SS_PBE 65536
+#endif
+constexpr size_t kPersonBucketEvents = SS_PBE;  // person buckets: few enough that staging groups stay in L2
 
 #pragma pack(push, 8)
 // Click times relative to the click window start: 32 bits when events pack in u64.
@@ -298,7 +301,10 @@ struct Pipeline {
     // Person lookups during the parse run this many lines after their
     // prefetch, so each (DRAM) miss overlaps the parsing of the lines between.
     static constexpr size_t kReadPiece = size_t(256) << 10;
-    static constexpr size_t kParseDelay = 16;
+#ifndef SS_PD
+#define SS_PD 16
+#endif
+    static constexpr size_t kParseDelay = SS_PD;
     template <class E>
     struct PendingEvent {
         Key eid, user;
