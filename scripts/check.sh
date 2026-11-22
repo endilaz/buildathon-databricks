@@ -10,6 +10,7 @@ OUT=$(mktemp -d); trap 'rm -rf "$OUT"' EXIT
 SHOPPING_WIDE=1 "$PY" "$STARTER/scripts/run_fixtures.py" "$STARTER/fixtures" -- "$BIN" | tail -1 | sed 's/^/wide: /'
 SHOPPING_WIDE=1 NCPU=8 "$BIN" "$BENCH/dev" "$OUT/dev-wide" && "$PY" "$STARTER/scripts/compare.py" "$OUT/dev-wide" "$BENCH/dev-answer" | tail -1 | sed 's/^/wide dev: /'
 NCPU=8 "$BIN" "$BENCH/dev" "$OUT/dev" && "$PY" "$STARTER/scripts/compare.py" "$OUT/dev" "$BENCH/dev-answer" | tail -1
+SHOPPING_MMAP=1 NCPU=8 "$BIN" "$BENCH/dev" "$OUT/dev-mmap" && "$PY" "$STARTER/scripts/compare.py" "$OUT/dev-mmap" "$BENCH/dev-answer" | tail -1 | sed 's/^/mmap dev: /'
 # undefined behaviour (misaligned references crash on x86 but not under emulation)
 make -s -C "$(dirname "$0")/.." ubsan
 UB="$(cd "$(dirname "$0")/.." && pwd)/shopping-sessions-ubsan"
