@@ -97,24 +97,32 @@ inline u64 mum(u64 a, u64 b) {
     return u64(r) ^ u64(r >> 64);
 }
 
-// Two independent 64-bit hashes of the n bytes at p; reads nothing outside them.
+// Two independent 64-bit hashes of the n bytes at p; reads nothing outside
+// them. Two multiply chains, 16 bytes a step (both words feed each 128-bit
+// multiply, as in wyhash): a 33-byte ID takes three dependent multiplies.
+inline u64 tail64(const char* p, size_t n) {
+    u64 w = 0;
+    std::memcpy(&w, p, n);
+    return w;
+}
 inline void id_hash(const char* p, size_t n, u64& h1, u64& h2) {
     constexpr u64 k1 = 0xA0761D6478BD642FULL, k2 = 0xE7037ED1A0B428DBULL;
+    constexpr u64 k3 = 0x8EBC6AF09C88C6E3ULL, k4 = 0x589965CC75374CC3ULL;
     u64 a = 0x243F6A8885A308D3ULL ^ n, b = 0x13198A2E03707344ULL ^ (u64(n) << 32);
     size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        u64 w = load64(p + i);
-        a = mum(a ^ w, k1);
-        b = mum(b ^ w, k2);
+    for (; i + 16 <= n; i += 16) {
+        u64 w0 = load64(p + i), w1 = load64(p + i + 8);
+        a = mum(a ^ w0 ^ k1, w1 ^ k2);
+        b = mum(b ^ w1 ^ k3, w0 ^ k4);
     }
     if (i < n) {
-        u64 w = 0;
-        std::memcpy(&w, p + i, n - i);
-        a = mum(a ^ w, k1);
-        b = mum(b ^ w, k2);
+        size_t r = n - i;
+        u64 w0 = r > 8 ? load64(p + i) : tail64(p + i, r), w1 = r > 8 ? tail64(p + i + 8, r - 8) : 0;
+        a = mum(a ^ w0 ^ k1, w1 ^ k2);
+        b = mum(b ^ w1 ^ k3, w0 ^ k4);
     }
-    h1 = mum(a ^ 0x8EBC6AF09C88C6E3ULL, 0x589965CC75374CC3ULL);
-    h2 = mum(b ^ 0x1D8E4E27C47D124FULL, 0xEB44ACCAB455D165ULL);
+    h1 = mum(a ^ 0x1D8E4E27C47D124FULL, 0xEB44ACCAB455D165ULL);
+    h2 = mum(b ^ 0x2D358DCCAA6C78A5ULL, 0x8BB84B93962EACC9ULL);
 }
 
 inline void cpu_relax() {

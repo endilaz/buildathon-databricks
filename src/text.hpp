@@ -311,6 +311,15 @@ inline bool prefixed_number_ref(Field id, char prefix, u32& num) {
 }
 
 
+// Exactly 13 epoch-ms digits (the generator's usual F3 length): two
+// overlapping 8-byte loads, no loops. Same result as parse_epoch_digits.
+[[gnu::always_inline]] inline bool parse_epoch13(const char* p, i64& out) {
+    u64 a = load64(p) ^ kAsciiZeros, b = load64(p + 5) ^ kAsciiZeros;
+    if (!digits_ok(a, kHighBits) || !digits_ok(b, kHighBits)) return false;
+    out = i64(eight_digits(a << 24) * 100000000 + eight_digits(b));  // digits 0..4 moved to the top
+    return true;
+}
+
 // Any of: YYYY-MM-DDTHH:MM:SSZ, YYYY-MM-DDTHH:MM:SS(+|-)HH:MM, epoch-ms digits.
 [[gnu::always_inline]] inline bool parse_ts(Field f, i64& out) {
     size_t n = f.size();
@@ -327,6 +336,7 @@ inline bool prefixed_number_ref(Field id, char prefix, u32& num) {
         out += sign == '+' ? -off : off;
         return true;
     }
+    if (n == 13) return parse_epoch13(p, out);
     return parse_epoch_digits(f, out);
 }
 

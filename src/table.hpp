@@ -13,10 +13,13 @@ struct KeySlot {
 };
 #pragma pack(pop)
 
+// Slots are picked by Fibonacci hashing (one multiply, high bits), which
+// spreads these keys well at half the latency of key_hash.
 template <class V>
 class KeyMap {
     std::vector<KeySlot<V>> slots_;
     size_t mask_ = 0, size_ = 0;
+    u32 shift_ = 60;
 
     static size_t capacity_for(size_t n) {
         size_t cap = 16;
@@ -27,6 +30,7 @@ class KeyMap {
         std::vector<KeySlot<V>> old(capacity_for(slots_.size()));
         old.swap(slots_);
         mask_ = slots_.size() - 1;
+        shift_ = 64 - u32(__builtin_ctzll(slots_.size()));
         size_ = 0;
         for (auto& s : old)
             if (s.k) insert(s.k, s.v);
@@ -42,17 +46,15 @@ public:
             std::vector<KeySlot<V>>(cap).swap(slots_);
         }
         mask_ = cap - 1;
+        shift_ = 64 - u32(__builtin_ctzll(cap));
         size_ = 0;
     }
     size_t size() const { return size_; }
-    size_t slot(Key k) const { return size_t(key_hash(k)) & mask_; }
+    size_t slot(Key k) const { return size_t((k * 0x9E3779B97F4A7C15ULL) >> shift_); }
     void prefetch_key(Key k) const { prefetch(&slots_[slot(k)]); }
-    void prefetch_hash(u64 h) const { prefetch(&slots_[size_t(h) & mask_]); }
 
-    const V* find(Key k) const { return find_hashed(k, key_hash(k)); }
-    // h must be key_hash(k)
-    const V* find_hashed(Key k, u64 h) const {
-        for (size_t i = size_t(h) & mask_;; i = (i + 1) & mask_) {
+    const V* find(Key k) const {
+        for (size_t i = slot(k);; i = (i + 1) & mask_) {
             const auto& s = slots_[i];
             if (s.k == k) return &s.v;
             if (!s.k) return nullptr;
