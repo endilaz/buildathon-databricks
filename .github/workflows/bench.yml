@@ -1,5 +1,6 @@
-# x86 benchmark of this branch against the competitor's public repo on a
-# GitHub-hosted runner. Results are pushed to the bench-results branch.
+# x86 benchmark of the Rust candidate on this branch against the submitted
+# build (origin/main), its feature variants and the C++ build, on 20M events
+# from the official generator. Results are pushed to the bench-results branch.
 name: x86 bench
 on:
   push:
@@ -15,30 +16,34 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Build this branch's image
+      - name: Build the candidate image, the submitted main and the C++ build
         run: |
-          docker build -q -t ours .
-          cid=$(docker create ours) && docker cp $cid:/shopping-sessions ./ours && docker rm $cid
-      - name: Build an unstripped copy for profiling, and the sweep variants
+          docker build -q -t cand .
+          cid=$(docker create cand) && docker cp $cid:/shopping-sessions ./cand && docker rm $cid
+          git worktree add -q wt-main origin/main
+          docker build -q -t subm wt-main
+          cid=$(docker create subm) && docker cp $cid:/shopping-sessions ./subm && docker rm $cid
+          docker build -q -f Dockerfile.cpp -t cpp .
+          cid=$(docker create cpp) && docker cp $cid:/shopping-sessions ./cpp && docker rm $cid
+      - name: Build the feature variants (host toolchain) and a profiling copy
         run: |
-          F="-O3 -DNDEBUG -flto=auto -fno-plt"
-          A="-march=x86-64-v3 -mtune=cascadelake"
-          make -s CXX=g++ ARCHFLAGS="$A" CXXFLAGS="$F -g -fno-omit-frame-pointer" LDFLAGS=-static BIN=ours-g
-          for v in "k64:" "k64pd8:-DSS_PD=8" "k64pb2k:-DSS_PBE=16384"; do
-            make -s -B CXX=g++ ARCHFLAGS="$A" CXXFLAGS="$F ${v#*:}" LDFLAGS=-static BIN=v-${v%%:*}
+          cd rust
+          rustc --version
+          T=x86_64-unknown-linux-gnu
+          F="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
+          RUSTFLAGS="$F" cargo build -q --release --offline --target $T && cp target/$T/release/shopping-sessions ../v-base
+          for f in scan64 pd8 bigdd nofilter; do
+            RUSTFLAGS="$F" cargo build -q --release --offline --features $f --target $T
+            cp target/$T/release/shopping-sessions ../v-$f
           done
-      - name: Build the base images (origin/main and the unstaged single scatter)
+          CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
+            RUSTFLAGS="$F -C force-frame-pointers=yes" cargo build -q --release --offline --target $T
+          cp target/$T/release/shopping-sessions ../cand-g
+      - name: Generate 20M events with the official generator
         run: |
-          for c in 0e598b9; do
-            git worktree add -q wt-$c $c
-            docker build -q -t img-$c wt-$c
-            cid=$(docker create img-$c) && docker cp $cid:/shopping-sessions ./bin-$c && docker rm $cid
-          done
-      - name: Fetch the data generator (generator only; no other pipeline is built)
-        run: git clone -q --depth 1 https://github.com/hansliu-dev/676767 ref
-      - name: Generate 20M events
-        run: |
-          cd ref/pgo/generator && cargo build --release -q
+          curl -fsSL -o gen.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
+          mkdir gen && unzip -q gen.zip -d gen
+          cd "$(dirname "$(find gen -name Cargo.toml | head -1)")" && cargo build --release -q
           ./target/release/generate --seed 21 --events 20000000 --clicks 5000000 --output $HOME/data
           du -sh $HOME/data
       - name: Benchmark

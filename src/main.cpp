@@ -37,8 +37,13 @@ struct PersonEvent {  // a valid event, filed under its person; ev is all ones o
 template <class E>
 struct DedupRec {  // every parsed copy of an event, by event_id
     Key eid;
-    PersonEvent<E>* ev;  // where its event was filed; null when the copy is invalid
+    // where its event was filed (null when the copy is invalid), and above
+    // bit 48 a long eid's check bits: equal keys with unequal checks are a
+    // hash collision (base.hpp)
+    u64 ev_check;
     i64 ingest;
+    PersonEvent<E>* ev() const { return reinterpret_cast<PersonEvent<E>*>(uintptr_t(ev_check & LongIds::kPtrMask)); }
+    u16 check() const { return u16(ev_check >> 48); }
 };
 template <class E>
 struct PersonClick {
@@ -60,7 +65,7 @@ struct Catalog {
     std::vector<u16> by_number;   // 0xFFFF: no such product
     KeyMap<u32> campaigns;
     std::vector<Key> campaign_ids;
-    std::vector<std::string> channels;
+    std::vector<std::string> campaign_names, channels;
 
     static bool product_number(Field id, char prefix, u32& num) { return prefixed_number(id, prefix, num); }
 
@@ -109,6 +114,7 @@ struct Catalog {
             Key k = make_key(f[0]);
             u32& idx = campaigns.get_or_insert(k, [&] {
                 campaign_ids.push_back(k);
+                campaign_names.emplace_back(f[0]);
                 channels.emplace_back();
                 return u32(campaign_ids.size() - 1);
             });
@@ -150,21 +156,28 @@ struct Persons {
     Key name(Key user) const { return name_hashed(user, key_hash(user)); }
     // Linked or not is a coin toss from line to line: the first slot's answer
     // is selected, not branched on; only a collision walks on.
-    Key name_select(Key user, u64 h) const {
+    // linked: whether user is in a link (so its bytes were recorded there)
+    Key name_select(Key user, u64 h, bool& linked) const {
         size_t i = slot(h);
         const auto& s = slots[i];
         Key k = s.k;
         Key hit = s.v;
-        if ((k != user) & (k != 0)) [[unlikely]] return name_hashed(user, h);
-        return k == user ? hit : user;
+        if ((k != user) & (k != 0)) [[unlikely]] return name_hashed(user, h, linked);
+        linked = k == user;
+        return linked ? hit : user;
     }
     // h must be key_hash(user)
-    Key name_hashed(Key user, u64 h) const {
+    Key name_hashed(Key user, u64 h, bool& linked) const {
         for (size_t i = slot(h);; i = next(i)) {
             const auto& s = slots[i];
-            if (s.k == user) return s.v;
+            linked = s.k == user;
+            if (linked) return s.v;
             if (!s.k) return user;
         }
+    }
+    Key name_hashed(Key user, u64 h) const {
+        bool linked;
+        return name_hashed(user, h, linked);
     }
     void prefetch_user(Key user) const { prefetch_hashed(key_hash(user)); }
     void prefetch_hashed(u64 h) const { prefetch(&slots[slot(h)]); }
@@ -247,19 +260,34 @@ inline Persons build_persons(std::vector<std::vector<std::pair<Key, Key>>>& pair
     }
     // in index order every parent is already final, so one pass compresses
     // all paths and finds each root's smallest name
+    // Each ID's first 8 bytes (zero padded, big-endian) order IDs whose
+    // prefixes differ, so the sequential pass below rarely needs the bytes
+    // of a long ID; they are read here, in parallel.
+    struct Named {
+        Key key;
+        u64 prefix;
+    };
     const size_t region = size_t(1) << out.region_bits;
-    std::vector<Key> name(ids);
+    std::vector<Named> name(ids);
     run_tasks(workers, P, [&](int&, size_t p) {
         for (size_t i = p * region; i < (p + 1) * region; ++i)
-            if (auto& s = out.slots[i]; s.k) name[offset[p] + u32(s.v)] = s.k;
+            if (auto& s = out.slots[i]; s.k) {
+                char buf[16];
+                std::string_view b = key_bytes(s.k, buf);
+                u64 prefix = 0;
+                for (size_t j = 0; j < 8; ++j) prefix = prefix << 8 | (j < b.size() ? u8(b[j]) : 0);
+                name[offset[p] + u32(s.v)] = Named{s.k, prefix};
+            }
     });
     for (u32 i = 0; i < ids; ++i) {
         u32 r = parent[i] = parent[parent[i]];
-        if (r != i && key_less(name[i], name[r])) name[r] = name[i];
+        if (r == i) continue;
+        const Named &a = name[i], &b = name[r];
+        if (a.prefix != b.prefix ? a.prefix < b.prefix : key_less(a.key, b.key)) name[r] = a;
     }
     run_tasks(workers, P, [&](int&, size_t p) {
         for (size_t i = p * region; i < (p + 1) * region; ++i)
-            if (auto& s = out.slots[i]; s.k) s.v = name[parent[offset[p] + u32(s.v)]];
+            if (auto& s = out.slots[i]; s.k) s.v = name[parent[offset[p] + u32(s.v)]].key;
     });
     for (auto& v : pairs) std::vector<std::pair<Key, Key>>().swap(v);
     return out;
@@ -288,6 +316,22 @@ inline size_t pow2_at_least(size_t n) {
 }
 inline u32 log2_exact(size_t p) { return u32(__builtin_ctzll(p)); }
 
+// ---------------------------------------------------------------- restart
+
+char** g_argv = nullptr;
+
+// Runs this program again from the start with var=val in its environment.
+[[noreturn]] void restart(const char* var, const char* val) {
+    setenv(var, val, 1);
+    std::fprintf(stderr, "shopping-sessions: restarting with %s=%s\n", var, val);
+    std::fflush(stderr);
+#ifdef __linux__
+    execv("/proc/self/exe", g_argv);
+#endif
+    execv(g_argv[0], g_argv);
+    die("cannot restart");
+}
+
 // ---------------------------------------------------------------- pipeline
 
 struct Pipeline {
@@ -305,12 +349,22 @@ struct Pipeline {
 #define SS_PD 12
 #endif
     static constexpr size_t kParseDelay = SS_PD;
+    // A long ID read at parse time, recorded (base.hpp) when its line is
+    // flushed, by then with its table slot prefetched. The bytes are still
+    // in the piece being parsed: pieces drain before the next is read.
+    struct LongRef {
+        const char* p;
+        u32 n;
+        u16 check;
+    };
     template <class E>
     struct PendingEvent {
         Key eid, user;
         i64 ingest;
         E ev;
         u64 h;  // key_hash(user)
+        LongRef user_ref;
+        u16 eid_check;
     };
     template <class E>
     struct ParseState {
@@ -320,6 +374,7 @@ struct Pipeline {
         PendingEvent<E> pending_ev[kParseDelay];
         PersonClick<E> pending_ck[kParseDelay];
         u64 pending_ck_h[kParseDelay];
+        LongRef pending_ck_user[kParseDelay], pending_ck_cid[kParseDelay];
         size_t nev = 0, nck = 0;
         std::vector<char> buf;  // the chunk being parsed, when inputs are read rather than mapped
         ParseState(size_t event_buckets, size_t person_buckets)
@@ -331,6 +386,30 @@ struct Pipeline {
 
     Pipeline(std::string d, std::string o, size_t t, bool profile)
         : data_dir(std::move(d)), out_dir(std::move(o)), threads(t), timer(profile) {}
+
+    // The long-ID table (base.hpp), sized for about 1.5x the long IDs to be
+    // recorded if 1 in 8 IDs is long: click IDs, link IDs and unlinked users.
+    // SHOPPING_LONG_SLOTS overrides, as a restart that found it too full sets it.
+    static void reserve_long_ids(size_t ev_bytes, size_t ck_bytes, size_t link_bytes) {
+        if (long_ids().exact) return;
+        // click lines ~50 bytes, link lines ~26 with 2 IDs each of ~1.4
+        // uses, unlinked users ~1 in 256 event lines (~80 bytes)
+        size_t want = ck_bytes / 50 / 8 + link_bytes / 26 / 6 + ev_bytes / 80 / 256 + 4096;
+        size_t slots = pow2_at_least(want + want / 2);
+        if (const char* s = std::getenv("SHOPPING_LONG_SLOTS")) slots = pow2_at_least(std::max<size_t>(16, std::strtoull(s, nullptr, 10)));
+        long_ids().reserve(slots);
+    }
+    // A long-ID key collision reruns with exact IDs, a full table with one four times the size.
+    void check_long_ids() {
+        auto& t = long_ids();
+        if (t.collided.load()) restart("SHOPPING_EXACT_IDS", "1");
+        if (t.full.load()) restart("SHOPPING_LONG_SLOTS", std::to_string(t.capacity() * 4).c_str());
+        if (timer.on && !t.exact) {
+            size_t used = 0;
+            for (size_t i = 0; i < t.capacity(); ++i) used += t.slots[i].key != 0;
+            std::fprintf(stderr, "[%8s] long IDs recorded: %zu of %zu slots\n", "", used, t.capacity());
+        }
+    }
 
     void read_manifest() {
         Input m = map_input(data_dir + "/manifest.json");
@@ -356,14 +435,29 @@ struct Pipeline {
     template <class E>
     void flush_event(ParseState<E>& st, size_t i) {
         const PendingEvent<E>& x = st.pending_ev[i];
-        Key person = persons.name_select(x.user, x.h);
+        bool linked;
+        Key person = persons.name_select(x.user, x.h, linked);
+        // a linked ID's bytes were recorded with the links
+        if (is_long(x.user) && !linked) [[unlikely]]
+            record_long(x.user, x.user_ref.check, x.user_ref.p, x.user_ref.n);
         PersonEvent<E>* p = st.ev.push(size_t(key_hash(person) >> person_shift), PersonEvent<E>{person, x.ev});
-        st.dd.push(size_t(key_hash(x.eid) >> event_shift), DedupRec<E>{x.eid, p, x.ingest});
+        st.dd.push(size_t(key_hash(x.eid) >> event_shift),
+                   DedupRec<E>{x.eid, u64(uintptr_t(p)) | u64(x.eid_check) << 48, x.ingest});
     }
     template <class E>
     void flush_click(ParseState<E>& st, size_t i) {
         PersonClick<E>& c = st.pending_ck[i];
-        c.person = persons.name_select(c.person, st.pending_ck_h[i]);
+        const Key user = c.person, cid = c.cid;  // packed members: copy before use
+        bool linked;
+        c.person = persons.name_select(user, st.pending_ck_h[i], linked);
+        if (is_long(user) && !linked) [[unlikely]] {
+            const LongRef& r = st.pending_ck_user[i];
+            record_long(user, r.check, r.p, r.n);
+        }
+        if (is_long(cid)) [[unlikely]] {
+            const LongRef& r = st.pending_ck_cid[i];
+            record_long(cid, r.check, r.p, r.n);
+        }
         st.ck.push(size_t(key_hash(c.person) >> person_shift), c);
     }
     template <class E>
@@ -378,7 +472,8 @@ struct Pipeline {
         if (f[0].empty()) return;
         i64 ingest;
         if (!parse_f1(f[3], ingest)) return;
-        Key eid = make_key(f[0]);
+        u16 eid_check = 0;
+        Key eid = make_key_check(f[0], eid_check);
         i64 ts;
         if (!f[1].empty() && !f[5].empty() && parse_ts(f[2], ts) && ts >= w.start && ts < w.end &&
             ingest - ts <= kDay) {
@@ -396,18 +491,22 @@ struct Pipeline {
             if (ok) {
                 // only purchases need a category: top_category sums purchase prices
                 u32 cat = price ? catalog->category(f[5]) : 0;
-                Key user = make_key(f[1]);
+                u16 check = 0;
+                Key user = make_key_check(f[1], check);
                 u64 h = key_hash(user);
                 persons.prefetch_hashed(h);
+                if (is_long(user)) [[unlikely]]
+                    prefetch_long(user);
                 size_t i = st.nev % kParseDelay;
                 if (st.nev >= kParseDelay) flush_event(st, i);
-                st.pending_ev[i] = PendingEvent<E>{eid, user, ingest, Pack<E>::event(u64(ts - w.start), cat, price), h};
+                st.pending_ev[i] = PendingEvent<E>{eid, user, ingest, Pack<E>::event(u64(ts - w.start), cat, price), h,
+                                                   LongRef{f[1].data(), u32(f[1].size()), check}, eid_check};
                 ++st.nev;
                 return;
             }
         }
         // an invalid copy files no event, but can still be the earliest copy
-        st.dd.push(size_t(key_hash(eid) >> event_shift), DedupRec<E>{eid, nullptr, ingest});
+        st.dd.push(size_t(key_hash(eid) >> event_shift), DedupRec<E>{eid, u64(eid_check) << 48, ingest});
     }
 
     template <class E>
@@ -417,13 +516,21 @@ struct Pipeline {
         if (!camp) return;
         i64 ts;
         if (!parse_ts(f[3], ts) || ts < w.click_start || ts >= w.end) return;
-        Key user = make_key(f[1]);
+        u16 ucheck = 0, ccheck = 0;
+        Key user = make_key_check(f[1], ucheck);
+        Key cid = make_key_check(f[0], ccheck);
         u64 h = key_hash(user);
         persons.prefetch_hashed(h);
+        if (is_long(user)) [[unlikely]]
+            prefetch_long(user);
+        if (is_long(cid)) [[unlikely]]
+            prefetch_long(cid);
         size_t i = st.nck % kParseDelay;
         if (st.nck >= kParseDelay) flush_click(st, i);
-        st.pending_ck[i] = PersonClick<E>{user, make_key(f[0]), Rel<E>(ts - w.click_start), *camp};
+        st.pending_ck[i] = PersonClick<E>{user, cid, Rel<E>(ts - w.click_start), *camp};
         st.pending_ck_h[i] = h;
+        st.pending_ck_user[i] = LongRef{f[1].data(), u32(f[1].size()), ucheck};
+        st.pending_ck_cid[i] = LongRef{f[0].data(), u32(f[0].size()), ccheck};
         ++st.nck;
     }
 
@@ -450,22 +557,24 @@ struct Pipeline {
         for (auto& f : event_files) ev_bytes += f.len;
         for (auto& f : click_files) ck_bytes += f.len;
         Reservation::global().reserve(2 * ev_bytes + 2 * ck_bytes + (threads << 28) + (size_t(256) << 20));
+        size_t link_bytes = 0;
+        for (auto& f : link_files) link_bytes += f.len;
+        reserve_long_ids(ev_bytes, ck_bytes, link_bytes);
         timer.lap("setup");
 
         // links
         std::vector<Chunk> chunks;
         plan_chunks(link_files, size_t(1) << 20, chunks);
         std::vector<std::vector<std::pair<Key, Key>>> link_pairs(threads);
-        size_t link_bytes = 0;
-        for (auto& f : link_files) link_bytes += f.len;
         for (auto& v : link_pairs) v.reserve(link_bytes / 18 / threads + 1024);  // lines are ~20 bytes
         run_tasks(link_pairs, chunks.size(), [&](auto& out, size_t i) {
             auto& c = chunks[i];
             for_lines<2>(*c.in, c.s, c.e, [&](Field (&f)[2]) {
-                if (!f[0].empty() && !f[1].empty()) out.emplace_back(make_key(f[0]), make_key(f[1]));
+                if (!f[0].empty() && !f[1].empty()) out.emplace_back(record_key(f[0]), record_key(f[1]));
             });
         });
         catalog_thread.join();
+        check_long_ids();  // the persons build reads link IDs' bytes
         timer.lap("links");
 
         // events are packed in 64 bits when the window, prices and categories fit
@@ -527,6 +636,7 @@ struct Pipeline {
                         to = std::min(file.len, to + (to - from));  // a very long line: read more
                     }
                     parse_range(Input{st.buf.data(), to - from, 0, -1}, ps - from, pe - from);
+                    drain(st);  // pending lines point into buf
                 }
             }
             drain(st);  // nothing may stay pending once the chunk is done
@@ -593,11 +703,13 @@ struct Pipeline {
                         if ((cur >> 32) == tag) {
                             const DedupRec<E>& o = rec((cur & 0xFFFFFFFFu) - 1);
                             if (o.eid == r.eid) {
+                                if (o.check() != r.check()) [[unlikely]]
+                                    long_ids().collided.store(true, std::memory_order_relaxed);
                                 if (r.ingest < o.ingest) {  // the new copy wins
                                     st.table[s] = entry;
-                                    if (o.ev) o.ev->ev = dropped;
-                                } else if (r.ev) {
-                                    r.ev->ev = dropped;
+                                    if (auto* e = o.ev()) e->ev = dropped;
+                                } else if (auto* e = r.ev()) {
+                                    e->ev = dropped;
                                 }
                                 break;
                             }
@@ -607,6 +719,7 @@ struct Pipeline {
             }
         });
         timer.lap("dedup");
+        check_long_ids();  // sessions and output read recorded bytes
 
         // ---- sessions per person bucket, biggest buckets first
         const u32 ncamp = u32(catalog->campaign_ids.size());
@@ -809,7 +922,7 @@ struct Pipeline {
                     id = "organic";
                     cols[1].add_string("organic");
                 } else {
-                    append_key(catalog->campaign_ids[c], id);
+                    id = catalog->campaign_names[c];
                     cols[1].add_string(catalog->channels[c]);
                 }
                 cols[0].add_string(id);
@@ -882,6 +995,7 @@ int main(int argc, char** argv) {
     long usable = available_cpus();
     threads = threads > 0 ? std::min(threads, usable) : usable;
     threads = std::clamp<long>(threads, 1, 64);
+    ss::g_argv = argv;
     ss::Pipeline p(data ? data : "/data", out ? out : "/output", size_t(threads),
                    std::getenv("SHOPPING_PROFILE") != nullptr);
     p.run();

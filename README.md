@@ -1,6 +1,10 @@
 # Databricks Shopping Sessions
 
-This C++20 pipeline turns raw clickstream CSVs into the two exact daily Parquet tables for the Databricks buildathon track. It is a single static binary on an empty image, with no runtime dependencies. All of its code was written for this event. [Track overview](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions) · [Data specification](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md?inline=1)
+This C++20 pipeline turns raw clickstream CSVs into the two exact daily Parquet tables for the Databricks buildathon track. It is a single static binary on an empty image, with no runtime dependencies. All of its code was written for this event.
+
+The scored entry, built by the root `Dockerfile`, is a Rust port of this pipeline in [`rust/`](rust/README.md). It uses the same algorithms and gives the same output at the same speed. `Dockerfile.cpp` builds the C++ version described below.
+
+[Track overview](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions) · [Data specification](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md?inline=1)
 
 ## Run the scored entry point
 
@@ -14,7 +18,7 @@ It reads `DATA_DIR` and `OUTPUT_DIR` (default `/data` and `/output`), or the las
 
 ## How it works
 
-IDs never live in memory as strings. An ID of up to 15 bytes is packed into a 128-bit integer: its bytes from the top, then its length in the lowest byte. Integer equality is string equality, and integer order is byte-wise string order, which the "smallest ID" and "smallest click_id" rules need. Longer IDs are interned and keep exact semantics. A person is represented by the key of its smallest ID, so no step ever builds a global name dictionary.
+IDs never live in memory as strings. An ID of up to 10 bytes from `[0-9A-Z_a-z]` is packed into a 64-bit integer, 6 bits per byte. Integer equality is string equality, and integer order is byte-wise string order, which the "smallest ID" and "smallest click_id" rules need. Any other ID is long: since the generator gives one in eight IDs a 32-digit hex suffix, that is about one ID in eight. A long ID is keyed by 63 bits of a hash of its bytes, computed where it is read, with no shared state. Only user, click and link IDs, whose bytes may be needed for names, ties or output, are also filed in one lock-free insert-only table, together with 16 more hash bits. Event IDs carry those 16 bits into dedup. So two distinct IDs that share a key are noticed, and the run restarts with `SHOPPING_EXACT_IDS=1`, which interns long IDs exactly. A table too full to take more restarts the run with a table four times the size. A person is represented by the key of its smallest ID, so no step ever builds a global name dictionary.
 
 1. **Links.** Link files are split in parallel. The persons map is built in parallel before the parse. Link endpoints are split by key hash into 64 regions of one flat table, and each region gives its IDs dense indexes. Union-find then runs over those indexes, and each region maps its IDs to their person's name, the smallest ID. An unlinked ID names itself.
 2. **Parse.** Each worker reads 4 MB chunks of the memory-mapped inputs. Fields are found from 64-byte separator and quote bitmasks (AVX2 or NEON). Timestamps are validated and converted with 8-byte loads and a month table. Every event line with a non-empty `event_id` becomes a 48-byte record holding the event already packed as one integer (time, price, and category for purchases), or all ones if it fails validation, so an invalid earliest copy still wins dedup. Records are scattered into blocks by `event_id` hash; nothing is reallocated or copied.

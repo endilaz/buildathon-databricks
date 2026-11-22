@@ -22,10 +22,8 @@ struct Column {
         values.append(s);
     }
     void add_key(Key k) {
-        if (is_interned(k)) [[unlikely]] {
-            std::string s;
-            append_key(k, s);
-            add_string(s);
+        if (is_long(k)) [[unlikely]] {
+            add_string(long_bytes(k));
             return;
         }
         char buf[16];

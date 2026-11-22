@@ -97,22 +97,28 @@ static void product_numbers() {
 }
 
 // Keys: integer order is byte order, equality is string equality, and
-// every key spells its string back, for packed and interned IDs alike.
+// every recorded key spells its string back, for packed and long IDs alike.
 static void keys() {
     const std::string alphabet = "019AZ_az mu\t\r\x01\xff";
     std::vector<std::string> ids;
     for (int i = 0; i < 4000; ++i) {
-        size_t n = 1 + rng() % (rng() % 4 ? 10 : 14);
+        size_t n = 1 + rng() % (rng() % 4 ? 10 : rng() % 2 ? 14 : 40);
         std::string s;
         for (size_t j = 0; j < n; ++j) s.push_back(alphabet[rng() % (rng() % 5 ? 9 : alphabet.size())]);
         ids.push_back(s);
     }
-    ids.insert(ids.end(), {"u1", "u10", "u1 ", " u1", "U1", "a", "a_", "aZ", "zzzzzzzzzz", "zzzzzzzzzzz", "0", "_"});
+    ids.insert(ids.end(), {"u1", "u10", "u1 ", " u1", "U1", "a", "a_", "aZ", "zzzzzzzzzz", "zzzzzzzzzzz", "0", "_",
+                           "u0123456789abcdef0123456789abcdef", "u0123456789abcdef0123456789abcdee",
+                           "U0123456789ABCDEF0123456789ABCDEF", "u0123456789abcdef0123456789abcdef0"});
+    if (!long_ids().capacity()) long_ids().reserve(size_t(1) << 16);
     std::vector<Key> k;
     for (auto& s : ids) {
         std::string b = padded(s);
-        k.push_back(make_key(b.data(), s.size()));
+        Key r = record_key(b.data(), s.size());
+        CHECK(make_key(b.data(), s.size()) == r, "make_key and record_key differ on '%s'", s.c_str());
+        k.push_back(r);
     }
+    CHECK(!long_ids().collided && !long_ids().full, "long-ID table collided or full");
     for (size_t i = 0; i < ids.size(); ++i) {
         std::string back;
         append_key(k[i], back);
