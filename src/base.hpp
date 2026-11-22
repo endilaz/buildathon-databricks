@@ -50,14 +50,36 @@ inline u32 load32(const char* p) {
 
 // ---------------------------------------------------------------- keys
 //
-// An ID of 1..15 bytes becomes a u128 holding its bytes from the most
-// significant end, zero padded, with the length in the lowest byte. Comparing
-// two such integers compares the strings byte-wise (the length byte settles
-// a string against its own NUL-extended forms), and equal integers mean equal
-// strings. Zero is never a key. Longer IDs are interned and keyed
-// (index << 8) | 0xFF; equality stays exact and ordering falls back to bytes.
-using Key = u128;
-constexpr u8 kLongTag = 0xFF;
+// An ID of 1..10 bytes from [0-9A-Z_a-z] becomes a u64: each byte a 6-bit
+// code (1..63, in ASCII order; 0 pads), the first byte in the top bits of the
+// low 60. Integer order is byte-wise order (padding sorts first, as a prefix
+// does) and equal integers mean equal strings; zero is never a key. Every
+// ID the generator writes fits. Any other ID (another byte, or longer) is
+// interned and keyed kInterned | index: equality stays exact and ordering
+// falls back to the bytes.
+using Key = u64;
+constexpr Key kInterned = Key(1) << 63;
+
+struct KeyCodes {
+    u8 code[256];  // 0xFF: not in the alphabet
+    char byte[64];
+};
+constexpr KeyCodes make_key_codes() {
+    KeyCodes t{};
+    for (int c = 0; c < 256; ++c) t.code[c] = 0xFF;
+    u8 next = 1;
+    for (int c = 0; c < 256; ++c) {
+        bool in = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || c == '_' || (c >= 'a' && c <= 'z');
+        if (in) {
+            t.code[c] = next;
+            t.byte[next] = char(c);
+            ++next;
+        }
+    }
+    return t;
+}
+inline constexpr KeyCodes kKeyCodes = make_key_codes();
+static_assert(kKeyCodes.code[u8('z')] == 63 && kKeyCodes.code[u8('0')] == 1);
 
 struct LongIds {
     std::mutex mu;
@@ -74,17 +96,20 @@ inline LongIds& long_ids() {
     std::lock_guard<std::mutex> lock(t.mu);
     auto [it, fresh] = t.index.try_emplace(std::string(p, n), u32(t.names.size()));
     if (fresh) t.names.emplace_back(p, n);
-    return (Key(it->second) << 8) | kLongTag;
+    return kInterned | it->second;
 }
 
 // Requires n >= 1 and 16 readable bytes at p (every input buffer is padded).
 [[gnu::always_inline]] inline Key make_key(const char* p, size_t n) {
-    if (n <= 15) [[likely]] {
-        u64 hi = __builtin_bswap64(load64(p));
-        u64 lo = __builtin_bswap64(load64(p + 8));
-        Key k = (Key(hi) << 64) | lo;
-        k &= ~Key(0) << (8 * (16 - n));
-        return k | Key(n);
+    if (n <= 10) [[likely]] {
+        u64 v = 0;
+        u32 bad = 0;
+        for (size_t i = 0; i < 10; ++i) {
+            u32 c = i < n ? kKeyCodes.code[u8(p[i])] : 0;
+            bad |= c;
+            v = (v << 6) | (c & 63);
+        }
+        if (!(bad & 0xC0)) [[likely]] return v;
     }
     return intern_long(p, n);
 }
@@ -92,23 +117,34 @@ inline LongIds& long_ids() {
 
 // For values that are not inside a padded buffer.
 inline Key make_key_copy(std::string_view s) {
-    if (s.size() > 15) return intern_long(s.data(), s.size());
+    if (s.size() > 10) return intern_long(s.data(), s.size());
     char buf[32] = {};
     std::memcpy(buf, s.data(), s.size());
     return make_key(buf, s.size());
 }
 
-inline bool is_long(Key k) { return u8(k) == kLongTag; }
+inline bool is_interned(Key k) { return (k & kInterned) != 0; }
+
+// A packed key's bytes into out (at most 10); returns their count.
+inline size_t packed_bytes(Key k, char* out) {
+    size_t n = 0;
+    for (int i = 0; i < 10; ++i) {
+        u32 c = u32(k >> (54 - 6 * i)) & 63;
+        if (!c) break;
+        out[n++] = kKeyCodes.byte[c];
+    }
+    return n;
+}
 
 inline void append_key(Key k, std::string& out) {
-    if (is_long(k)) [[unlikely]] {
+    if (is_interned(k)) [[unlikely]] {
         auto& t = long_ids();
         std::lock_guard<std::mutex> lock(t.mu);
-        out += t.names[u32(k >> 8)];
+        out += t.names[u32(k)];
         return;
     }
-    size_t n = u8(k);
-    for (size_t i = 0; i < n; ++i) out.push_back(char(u8(k >> (8 * (15 - i)))));
+    char buf[16];
+    out.append(buf, packed_bytes(k, buf));
 }
 
 [[gnu::cold, gnu::noinline]] inline bool key_less_slow(Key a, Key b) {
@@ -119,7 +155,7 @@ inline void append_key(Key k, std::string& out) {
     return x < y;  // std::string compares as unsigned bytes
 }
 inline bool key_less(Key a, Key b) {
-    if ((u8(a) == kLongTag) || (u8(b) == kLongTag)) [[unlikely]] return key_less_slow(a, b);
+    if (((a | b) & kInterned) != 0) [[unlikely]] return key_less_slow(a, b);
     return a < b;
 }
 
@@ -131,10 +167,7 @@ inline u64 mix64(u64 x) {
     x ^= x >> 32;
     return x;
 }
-[[gnu::always_inline]] inline u64 key_hash(Key k) {
-    u64 hi = u64(k >> 64), lo = u64(k);
-    return mix64(hi ^ ((lo * 0x9E3779B97F4A7C15ULL) >> 7 | (lo * 0x9E3779B97F4A7C15ULL) << 57));
-}
+[[gnu::always_inline]] inline u64 key_hash(Key k) { return mix64(k * 0x9E3779B97F4A7C15ULL); }
 
 inline void prefetch(const void* p) { __builtin_prefetch(p, 0, 3); }
 
