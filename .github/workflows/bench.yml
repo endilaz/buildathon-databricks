@@ -11,8 +11,12 @@ jobs:
   bench:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      BASE: 0e598b9
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Build this branch's image
         run: |
           docker build -q -t ours .
@@ -21,11 +25,14 @@ jobs:
         run: |
           make CXX=g++ ARCHFLAGS="-march=x86-64-v3 -mtune=cascadelake" \
             CXXFLAGS="-O3 -DNDEBUG -flto=auto -fno-plt -g -fno-omit-frame-pointer" LDFLAGS=-static BIN=ours-g
-      - name: Build the reference image
+      - name: Build the base commit's image
         run: |
-          git clone -q --depth 1 https://github.com/hansliu-dev/676767 ref
-          (cd ref && git log --oneline -1 && docker build -q -t refimg .)
-          cid=$(docker create refimg) && docker cp $cid:/shopping-sessions ./refbin && docker rm $cid
+          git fetch -q origin "${BASE:-0e598b9}" || git fetch -q --unshallow origin
+          git worktree add -q base "${BASE:-0e598b9}"
+          docker build -q -t baseimg base
+          cid=$(docker create baseimg) && docker cp $cid:/shopping-sessions ./basebin && docker rm $cid
+      - name: Fetch the data generator (generator only; no other pipeline is built)
+        run: git clone -q --depth 1 https://github.com/hansliu-dev/676767 ref
       - name: Generate 20M events
         run: |
           cd ref/pgo/generator && cargo build --release -q
