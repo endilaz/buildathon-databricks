@@ -126,6 +126,12 @@ struct Catalog {
 
 // ---------------------------------------------------------------- links
 
+inline size_t pow2_at_least(size_t n) {
+    size_t p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
 struct Persons {
     // every ID in a kept link line -> its person's name: one flat
     // linear-probing table (one huge-page allocation), split by the top bits
@@ -135,6 +141,29 @@ struct Persons {
     std::vector<KeySlot<Key>> slots = std::vector<KeySlot<Key>>(size_t(1) << kPartBits);
     size_t region_bits = 0;  // each region holds 2^region_bits slots
     size_t count = 0;
+    // One bit per hash value (about 8 bits per linked ID, so it stays in
+    // cache) set for every linked ID: a user whose bit is clear is not
+    // linked, and its lookup reads kEmptySlot (always in L1) instead of a
+    // slot of the big table. The choice is a select, not a branch.
+    static constexpr u32 kFilterShift = 24;  // above the bits that pick a slot
+    std::vector<u64> filter = std::vector<u64>(1, 0);
+    size_t filter_mask = 63;
+    static inline const KeySlot<Key> kEmptySlot{0, 0};
+
+    const KeySlot<Key>* lookup_slot(u64 h) const {
+        size_t i = size_t(h >> kFilterShift) & filter_mask;
+        uintptr_t flagged = (filter[i >> 6] >> (i & 63)) & 1;
+        uintptr_t real = uintptr_t(&slots[slot(h)]), empty = uintptr_t(&kEmptySlot);
+        return reinterpret_cast<const KeySlot<Key>*>(empty ^ ((real ^ empty) & (0 - flagged)));
+    }
+    // As name_select, reading the slot lookup_slot chose (only a real slot
+    // can hold another key, so kEmptySlot never walks).
+    Key name_at(Key user, u64 h, const KeySlot<Key>* s, bool& linked) const {
+        Key k = s->k, hit = s->v;
+        if ((k != user) & (k != 0)) [[unlikely]] return name_hashed(user, h, linked);
+        linked = k == user;
+        return linked ? hit : user;
+    }
 
     size_t slot(u64 h) const { return (part(h) << region_bits) | (size_t(h) & ((size_t(1) << region_bits) - 1)); }
     size_t next(size_t i) const {
@@ -289,6 +318,17 @@ inline Persons build_persons(std::vector<std::vector<std::pair<Key, Key>>>& pair
         for (size_t i = p * region; i < (p + 1) * region; ++i)
             if (auto& s = out.slots[i]; s.k) s.v = name[parent[offset[p] + u32(s.v)]].key;
     });
+    // the filter: 8 bits per endpoint, each linked ID's bit set
+    size_t fbits = std::clamp<size_t>(pow2_at_least(16 * n), size_t(1) << 16, size_t(1) << 30);
+    out.filter.assign(fbits / 64, 0);
+    out.filter_mask = fbits - 1;
+    run_tasks(workers, P, [&](int&, size_t p) {
+        for (size_t i = p * region; i < (p + 1) * region; ++i)
+            if (auto& s = out.slots[i]; s.k) {
+                size_t b = size_t(key_hash(s.k) >> Persons::kFilterShift) & out.filter_mask;
+                __atomic_fetch_or(&out.filter[b >> 6], u64(1) << (b & 63), __ATOMIC_RELAXED);
+            }
+    });
     for (auto& v : pairs) std::vector<std::pair<Key, Key>>().swap(v);
     return out;
 }
@@ -309,11 +349,6 @@ inline void plan_chunks(const std::vector<Input>& files, size_t target, std::vec
     }
 }
 
-inline size_t pow2_at_least(size_t n) {
-    size_t p = 1;
-    while (p < n) p <<= 1;
-    return p;
-}
 inline u32 log2_exact(size_t p) { return u32(__builtin_ctzll(p)); }
 
 // ---------------------------------------------------------------- restart
@@ -363,6 +398,7 @@ struct Pipeline {
         i64 ingest;
         E ev;
         u64 h;  // key_hash(user)
+        const KeySlot<Key>* slot;  // persons.lookup_slot(h), prefetched
         LongRef user_ref;
         u16 eid_check;
     };
@@ -374,6 +410,7 @@ struct Pipeline {
         PendingEvent<E> pending_ev[kParseDelay];
         PersonClick<E> pending_ck[kParseDelay];
         u64 pending_ck_h[kParseDelay];
+        const KeySlot<Key>* pending_ck_slot[kParseDelay];
         LongRef pending_ck_user[kParseDelay], pending_ck_cid[kParseDelay];
         size_t nev = 0, nck = 0;
         std::vector<char> buf;  // the chunk being parsed, when inputs are read rather than mapped
@@ -436,7 +473,7 @@ struct Pipeline {
     void flush_event(ParseState<E>& st, size_t i) {
         const PendingEvent<E>& x = st.pending_ev[i];
         bool linked;
-        Key person = persons.name_select(x.user, x.h, linked);
+        Key person = persons.name_at(x.user, x.h, x.slot, linked);
         // a linked ID's bytes were recorded with the links
         if (is_long(x.user) && !linked) [[unlikely]]
             record_long(x.user, x.user_ref.check, x.user_ref.p, x.user_ref.n);
@@ -449,7 +486,7 @@ struct Pipeline {
         PersonClick<E>& c = st.pending_ck[i];
         const Key user = c.person, cid = c.cid;  // packed members: copy before use
         bool linked;
-        c.person = persons.name_select(user, st.pending_ck_h[i], linked);
+        c.person = persons.name_at(user, st.pending_ck_h[i], st.pending_ck_slot[i], linked);
         if (is_long(user) && !linked) [[unlikely]] {
             const LongRef& r = st.pending_ck_user[i];
             record_long(user, r.check, r.p, r.n);
@@ -494,13 +531,14 @@ struct Pipeline {
                 u16 check = 0;
                 Key user = make_key_check(f[1], check);
                 u64 h = key_hash(user);
-                persons.prefetch_hashed(h);
+                const KeySlot<Key>* slot = persons.lookup_slot(h);
+                prefetch(slot);
                 if (is_long(user)) [[unlikely]]
                     prefetch_long(user);
                 size_t i = st.nev % kParseDelay;
                 if (st.nev >= kParseDelay) flush_event(st, i);
                 st.pending_ev[i] = PendingEvent<E>{eid, user, ingest, Pack<E>::event(u64(ts - w.start), cat, price), h,
-                                                   LongRef{f[1].data(), u32(f[1].size()), check}, eid_check};
+                                                   slot, LongRef{f[1].data(), u32(f[1].size()), check}, eid_check};
                 ++st.nev;
                 return;
             }
@@ -520,7 +558,8 @@ struct Pipeline {
         Key user = make_key_check(f[1], ucheck);
         Key cid = make_key_check(f[0], ccheck);
         u64 h = key_hash(user);
-        persons.prefetch_hashed(h);
+        const KeySlot<Key>* slot = persons.lookup_slot(h);
+        prefetch(slot);
         if (is_long(user)) [[unlikely]]
             prefetch_long(user);
         if (is_long(cid)) [[unlikely]]
@@ -529,6 +568,7 @@ struct Pipeline {
         if (st.nck >= kParseDelay) flush_click(st, i);
         st.pending_ck[i] = PersonClick<E>{user, cid, Rel<E>(ts - w.click_start), *camp};
         st.pending_ck_h[i] = h;
+        st.pending_ck_slot[i] = slot;
         st.pending_ck_user[i] = LongRef{f[1].data(), u32(f[1].size()), ucheck};
         st.pending_ck_cid[i] = LongRef{f[0].data(), u32(f[0].size()), ccheck};
         ++st.nck;
@@ -755,7 +795,7 @@ struct Pipeline {
             size_t n = 0;
             for (auto& d : parsed) n += d.ev.size(p);
             if (!n) return;
-            st.local.reset(n / 48 + 16);
+            st.local.reset(n / 12 + 16);  // about 20 events per person: room without regrowing
             st.names.clear();
             st.offsets.assign(1, 0);
             st.raw.resize(n);

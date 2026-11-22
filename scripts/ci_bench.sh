@@ -21,19 +21,13 @@ run() {  # name env binary
   rm -rf -- "$O"
 }
 echo "host $(cat rustc.txt 2>/dev/null)" >> "$OUT"
-echo "== NCPU=$NC: subm = origin/main image, cand = this branch's image, v-* = host-built variants" >> "$OUT"
-for i in $(seq 1 10); do
+echo "== NCPU=$NC: subm = origin/main image (Rust), cand = this branch (Rust), cppold = origin/main Dockerfile.cpp, cppnew = this branch Dockerfile.cpp" >> "$OUT"
+for i in $(seq 1 15); do
   run subm "X=1" ./subm >> "$OUT"
   run cand "X=1" ./cand >> "$OUT"
-  run base "X=1" ./v-base >> "$OUT"
   run stage2 "X=1" ./v-stage2 >> "$OUT"
-  run fb4 "SHOPPING_FBITS=4" ./cand >> "$OUT"
-  run fb2 "SHOPPING_FBITS=2" ./cand >> "$OUT"
-  run pbe16k "SHOPPING_PBE=16384" ./cand >> "$OUT"
-  run pbe64k "SHOPPING_PBE=65536" ./cand >> "$OUT"
-  run pc128k "SHOPPING_PIECE=131072" ./cand >> "$OUT"
-  run pc512k "SHOPPING_PIECE=524288" ./cand >> "$OUT"
-  run cpp "X=1" ./cpp >> "$OUT"
+  run cppold "X=1" ./cppold >> "$OUT"
+  run cppnew "X=1" ./cpp >> "$OUT"
 done
 # outputs of the candidate and the submitted build must agree
 A=$(mktemp -d); B=$(mktemp -d)

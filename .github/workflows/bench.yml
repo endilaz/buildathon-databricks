@@ -25,6 +25,8 @@ jobs:
           cid=$(docker create subm) && docker cp $cid:/shopping-sessions ./subm && docker rm $cid
           docker build -q -f Dockerfile.cpp -t cpp .
           cid=$(docker create cpp) && docker cp $cid:/shopping-sessions ./cpp && docker rm $cid
+          docker build -q -f wt-main/Dockerfile.cpp -t cppold wt-main
+          cid=$(docker create cppold) && docker cp $cid:/shopping-sessions ./cppold && docker rm $cid
       - name: Build the feature variants (host toolchain) and a profiling copy
         run: |
           cd rust
