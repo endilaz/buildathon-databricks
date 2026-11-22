@@ -24,8 +24,7 @@ jobs:
           F="-O3 -DNDEBUG -flto=auto -fno-plt"
           A="-march=x86-64-v3 -mtune=cascadelake"
           make -s CXX=g++ ARCHFLAGS="$A" CXXFLAGS="$F -g -fno-omit-frame-pointer" LDFLAGS=-static BIN=ours-g
-          for v in "pd8:-DSS_PD=8" "pd12:-DSS_PD=12" "pd16:-DSS_PD=16" "pd24:-DSS_PD=24" \
-                   "pb1k:-DSS_PD=12 -DSS_PBE=32768" "pb2k:-DSS_PD=12 -DSS_PBE=16384"; do
+          for v in "k64:" "k64pd8:-DSS_PD=8" "k64pb2k:-DSS_PBE=16384"; do
             make -s -B CXX=g++ ARCHFLAGS="$A" CXXFLAGS="$F ${v#*:}" LDFLAGS=-static BIN=v-${v%%:*}
           done
       - name: Build the base images (origin/main and the unstaged single scatter)

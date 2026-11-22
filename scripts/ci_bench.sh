@@ -27,11 +27,14 @@ run_env() {  # name env binary
   printf "%-6s wall=%5sms  " "$1" $(( (e-s)/1000000 ))
   awk '/ms\]/{printf "%s=%s ", $4, $5} /^time:/{printf " %s %s %s %s", $2, $3, $4, $5}' /tmp/log; echo
 }
-echo "== THP=madvise NCPU=$NC: main=0e598b9 (docker image) vs sweep variants of this branch (native g++, mmap unless -pr)" >> "$OUT"
-for i in 1 2 3 4 5 6; do
+echo "== THP=madvise NCPU=$NC: main=0e598b9 (docker image) vs 64-bit-key variants (native g++; pread unless -mm)" >> "$OUT"
+for i in 1 2 3 4 5 6 7 8; do
   run_env main "X=1" ./bin-0e598b9 >> "$OUT"
-  for v in pd8 pd12 pd16 pd24 pb1k pb2k; do run_env $v "SHOPPING_MMAP=1" ./v-$v >> "$OUT"; done
-  run_env pd12pr "X=1" ./v-pd12 >> "$OUT"
+  run_env k64 "X=1" ./v-k64 >> "$OUT"
+  run_env k64mm "SHOPPING_MMAP=1" ./v-k64 >> "$OUT"
+  run_env k64pd8 "X=1" ./v-k64pd8 >> "$OUT"
+  run_env k64pb2k "X=1" ./v-k64pb2k >> "$OUT"
+  run_env dock "X=1" ./ours >> "$OUT"
 done
 # hardware counters and profiles (may be unavailable in the VM)
 sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" > /dev/null 2>&1 || true
