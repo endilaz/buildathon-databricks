@@ -68,13 +68,23 @@ unsafe fn block_masks(p: *const u8) -> Masks {
 // Walks data[0, len) from a line start. The end of the data acts as a
 // newline. A field is well formed when it has no quotes, or is wrapped in
 // one pair with none inside; a per-line quote count checks the latter.
+// Masks cover 128 bytes (two blocks) per refill: a refill comes at a point
+// in the line the branch predictor cannot learn, so halving refills halves
+// those mispredictions (marginally slower on arm64; kept for x86, where the
+// masks are cheaper and mispredictions dearer). Feature scan64: one block.
+#[cfg(not(feature = "scan64"))]
+type Mask = u128;
+#[cfg(feature = "scan64")]
+type Mask = u64;
+const SPAN: usize = Mask::BITS as usize;
+
 struct Scanner {
     d: *const u8,
     len: usize,
     base: usize,
-    seps: u64,
-    nl: u64,
-    quote: u64,
+    seps: Mask,
+    nl: Mask,
+    quote: Mask,
     quotes: u32,      // quotes in [start, base)
     line_quotes: u32, // quotes in [start, current line start)
 }
@@ -82,17 +92,29 @@ struct Scanner {
 impl Scanner {
     #[inline(always)]
     fn load(&mut self) {
-        let mut m = unsafe { block_masks(self.d.add(self.base)) };
         let left = self.len - self.base;
-        if left < 64 {
-            let keep = (1u64 << left) - 1;
-            m.nl = (m.nl & keep) | (1u64 << left);
-            m.sep = (m.sep & keep) | m.nl;
-            m.quote &= keep;
+        let a = unsafe { block_masks(self.d.add(self.base)) };
+        let (mut nl, mut sep, mut quote) = (a.nl as Mask, a.sep as Mask, a.quote as Mask);
+        #[cfg(not(feature = "scan64"))]
+        {
+            // the second block only while it starts inside the data (the
+            // padding covers 64 bytes past the end, not 128)
+            if left > 64 {
+                let b = unsafe { block_masks(self.d.add(self.base + 64)) };
+                nl |= (b.nl as Mask) << 64;
+                sep |= (b.sep as Mask) << 64;
+                quote |= (b.quote as Mask) << 64;
+            }
         }
-        self.nl = m.nl;
-        self.quote = m.quote;
-        self.seps = m.sep;
+        if left < SPAN {
+            let keep = ((1 as Mask) << left) - 1;
+            nl = (nl & keep) | ((1 as Mask) << left);
+            sep = (sep & keep) | nl;
+            quote &= keep;
+        }
+        self.nl = nl;
+        self.quote = quote;
+        self.seps = sep;
     }
     fn new(d: *const u8, len: usize, pos: usize) -> Scanner {
         let mut s = Scanner { d, len, base: pos, seps: 0, nl: 0, quote: 0, quotes: 0, line_quotes: 0 };
@@ -109,7 +131,7 @@ impl Scanner {
         loop {
             while self.seps == 0 {
                 self.quotes += self.quote.count_ones();
-                self.base += 64;
+                self.base += SPAN;
                 self.load();
             }
             let bit = self.seps.trailing_zeros();
@@ -127,7 +149,7 @@ impl Scanner {
                 f[k] = Field { p: unsafe { a.add(quoted as usize) }, n: n - 2 * quoted as usize };
             }
             if (self.nl >> bit) & 1 != 0 {
-                let seen = self.quotes + (self.quote & ((1u64 << bit) - 1)).count_ones();
+                let seen = self.quotes + (self.quote & (((1 as Mask) << bit) - 1)).count_ones();
                 let ok = k == N - 1 && seen - self.line_quotes == expect;
                 self.line_quotes = seen;
                 return (q + 1, ok);
@@ -227,7 +249,10 @@ const fn make_month_table() -> ([i32; 1560], [u8; 1560]) {
 }
 static MONTHS: ([i32; 1560], [u8; 1560]) = make_month_table();
 
-// YYYY-MM-DDTHH:MM:SS at p, in epoch milliseconds.
+// YYYY-MM-DDTHH:MM:SS at p, in epoch milliseconds. Digit pairs are combined
+// in one multiply per word (SWAR): with the separator bytes zeroed (a 'T'
+// times 10 would carry into the hour), x * 10 + (x >> 8) leaves at byte i
+// the two-digit value of bytes i and i + 1, each byte at most 99.
 #[inline(always)]
 unsafe fn parse_civil(p: *const u8) -> Option<i64> {
     // little-endian loads: byte i of a word is p[offset + i]
@@ -243,29 +268,35 @@ unsafe fn parse_civil(p: *const u8) -> Option<i64> {
     if !seps || !digits_ok(xa, 0x0080800080808080) || !digits_ok(xb, 0x8080008080008080) || !digits_ok(xc, 0x808000) {
         return None;
     }
-    let year = byte_at(xa, 0) * 1000 + byte_at(xa, 1) * 100 + byte_at(xa, 2) * 10 + byte_at(xa, 3);
-    let month = byte_at(xa, 5) * 10 + byte_at(xa, 6);
-    let day = byte_at(xb, 0) * 10 + byte_at(xb, 1);
-    let hour = byte_at(xb, 3) * 10 + byte_at(xb, 4);
-    let minute = byte_at(xb, 6) * 10 + byte_at(xb, 7);
-    let second = byte_at(xc, 1) * 10 + byte_at(xc, 2);
+    let ta = xa & 0x00FFFF00FFFFFFFF;
+    let tb = xb & 0xFFFF00FFFF00FFFF;
+    let tc = xc & 0xFFFF00;
+    let pa = ta.wrapping_mul(10).wrapping_add(ta >> 8);
+    let pb = tb.wrapping_mul(10).wrapping_add(tb >> 8);
+    let pc = tc.wrapping_mul(10).wrapping_add(tc >> 8);
+    let year = (pa & 0xFF) as u32 * 100 + ((pa >> 16) & 0xFF) as u32;
+    let month = ((pa >> 40) & 0xFF) as u32;
+    let day = (pb & 0xFF) as u32;
+    let hour = ((pb >> 24) & 0xFF) as u32;
+    let minute = ((pb >> 48) & 0xFF) as u32;
+    let second = ((pc >> 8) & 0xFF) as u32;
     if month.wrapping_sub(1) > 11 || day == 0 || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
     let days;
     if year.wrapping_sub(TABLE_YEAR0) < TABLE_YEARS {
         let i = ((year - TABLE_YEAR0) * 12 + month - 1) as usize;
-        if day > MONTHS.1[i] as u32 {
+        if day > *MONTHS.1.get_unchecked(i) as u32 {
             return None;
         }
-        days = MONTHS.0[i] as i64 + day as i64 - 1;
+        days = *MONTHS.0.get_unchecked(i) as i64 + day as i64 - 1;
     } else {
         if day > MONTH_DAYS[(month - 1) as usize] as u32 + (month == 2 && is_leap(year)) as u32 {
             return None;
         }
         days = days_from_civil(year as i64, month as i64, day as i64);
     }
-    Some(days * DAY + hour as i64 * HOUR + minute as i64 * MINUTE + second as i64 * SECOND)
+    Some(days * DAY + ((hour * 60 + minute) * 60 + second) as i64 * SECOND)
 }
 
 // 8 digit values (one per byte, first digit lowest) -> their decimal value.
@@ -337,6 +368,20 @@ unsafe fn parse_epoch_digits(f: Field) -> Option<i64> {
     Some(v as i64)
 }
 
+// Exactly 13 epoch-ms digits (the generator's usual F3 length): two
+// overlapping 8-byte loads, no loops. Same result as parse_epoch_digits.
+#[inline(always)]
+unsafe fn parse_epoch13(p: *const u8) -> Option<i64> {
+    let a = load64(p) ^ ASCII_ZEROS; // digits 0..7
+    let b = load64(p.add(5)) ^ ASCII_ZEROS; // digits 5..12
+    if !digits_ok(a, HIGH_BITS) || !digits_ok(b, HIGH_BITS) {
+        return None;
+    }
+    // digits 0..4 moved to the top of a word (zeros enter as leading digits)
+    let hi = eight_digits(a << 24);
+    Some((hi * 100_000_000 + eight_digits(b)) as i64)
+}
+
 // Any of: YYYY-MM-DDTHH:MM:SSZ, YYYY-MM-DDTHH:MM:SS(+|-)HH:MM, epoch-ms digits.
 #[inline(always)]
 pub fn parse_ts(f: Field) -> Option<i64> {
@@ -359,6 +404,9 @@ pub fn parse_ts(f: Field) -> Option<i64> {
             }
             let off = oh as i64 * HOUR + om as i64 * MINUTE;
             return Some(if sign == b'+' { t - off } else { t + off });
+        }
+        if n == 13 {
+            return parse_epoch13(f.p);
         }
         parse_epoch_digits(f)
     }
@@ -403,6 +451,71 @@ pub fn parse_price(f: Field) -> Option<u32> {
 mod tests {
     use super::*;
 
+    // YYYY-MM-DDTHH:MM:SS at p, in epoch milliseconds.
+    unsafe fn parse_civil_ref(p: *const u8) -> Option<i64> {
+        // little-endian loads: byte i of a word is p[offset + i]
+        let a = load64(p); // Y Y Y Y - M M -
+        let b = load64(p.add(8)); // D D T H H : M M
+        let c = load64(p.add(16)) & 0xFFFFFF; // : S S
+        let seps = (a & 0xFF0000FF00000000) == 0x2D00002D00000000 // '-' at 4 and 7
+            && (b & 0x0000FF0000FF0000) == 0x00003A0000540000 // 'T' at 2, ':' at 5
+            && (c & 0xFF) == 0x3A; // ':'
+        let xa = a ^ ASCII_ZEROS;
+        let xb = b ^ ASCII_ZEROS;
+        let xc = c ^ 0x303030;
+        if !seps || !digits_ok(xa, 0x0080800080808080) || !digits_ok(xb, 0x8080008080008080) || !digits_ok(xc, 0x808000) {
+            return None;
+        }
+        let year = byte_at(xa, 0) * 1000 + byte_at(xa, 1) * 100 + byte_at(xa, 2) * 10 + byte_at(xa, 3);
+        let month = byte_at(xa, 5) * 10 + byte_at(xa, 6);
+        let day = byte_at(xb, 0) * 10 + byte_at(xb, 1);
+        let hour = byte_at(xb, 3) * 10 + byte_at(xb, 4);
+        let minute = byte_at(xb, 6) * 10 + byte_at(xb, 7);
+        let second = byte_at(xc, 1) * 10 + byte_at(xc, 2);
+        if month.wrapping_sub(1) > 11 || day == 0 || hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+        let days;
+        if year.wrapping_sub(TABLE_YEAR0) < TABLE_YEARS {
+            let i = ((year - TABLE_YEAR0) * 12 + month - 1) as usize;
+            if day > MONTHS.1[i] as u32 {
+                return None;
+            }
+            days = MONTHS.0[i] as i64 + day as i64 - 1;
+        } else {
+            if day > MONTH_DAYS[(month - 1) as usize] as u32 + (month == 2 && is_leap(year)) as u32 {
+                return None;
+            }
+            days = days_from_civil(year as i64, month as i64, day as i64);
+        }
+        Some(days * DAY + hour as i64 * HOUR + minute as i64 * MINUTE + second as i64 * SECOND)
+    }
+
+    // the SWAR parser agrees with the byte-wise one, valid or not
+    #[test]
+    fn civil_matches_reference() {
+        let mut x = 0x9E3779B97F4A7C15u64;
+        let mut buf = Vec::new();
+        for _ in 0..500_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let y = 1960 + x % 160;
+            let mo = (x >> 8) % 14;
+            let d = (x >> 12) % 33;
+            let h = (x >> 18) % 26;
+            let mi = (x >> 24) % 62;
+            let se = (x >> 30) % 62;
+            let mut t = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{se:02}").into_bytes();
+            if (x >> 36) % 5 == 0 {
+                let i = (x >> 40) as usize % 19;
+                t[i] = [b'/', b':', b'a', b' ', 0xB0, b'9' + 1, b'-', b'T'][(x >> 50) as usize % 8];
+            }
+            let f = field(&t, &mut buf);
+            assert_eq!(unsafe { parse_civil(f.p) }, unsafe { parse_civil_ref(f.p) }, "{:?}", String::from_utf8_lossy(&t));
+        }
+    }
+
     fn field(s: &[u8], buf: &mut Vec<u8>) -> Field {
         buf.clear();
         buf.extend_from_slice(s);
@@ -423,6 +536,20 @@ mod tests {
         assert_eq!(parse_ts(field(b"000000000000000000000086400000", &mut b)), Some(86_400_000));
         assert_eq!(parse_ts(field(b"99999999999999999999", &mut b)), None);
         assert_eq!(parse_ts(field(b"1.79e12", &mut b)), None);
+        // the 13-digit fast path agrees with the general one
+        let mut x = 0x2545F4914F6CDD1Du64;
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let mut s: Vec<u8> = format!("{:013}", x % 10_000_000_000_000).into_bytes();
+            if x % 7 == 0 {
+                let i = (x >> 20) as usize % 13;
+                s[i] = [b'/', b':', b'a', b' ', 0xB0, b'0' + 10][(x >> 40) as usize % 6];
+            }
+            let f = field(&s, &mut b);
+            assert_eq!(unsafe { parse_epoch13(f.p) }, unsafe { parse_epoch_digits(f) }, "{s:?}");
+        }
         assert_eq!(parse_price(field(b"0250", &mut b)), Some(250));
         assert_eq!(parse_price(field(b"10000001", &mut b)), None);
         assert_eq!(prefixed_number(field(b"p15616", &mut b), b'p'), Some(15616));

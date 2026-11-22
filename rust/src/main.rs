@@ -27,7 +27,12 @@ use text::*;
 #[global_allocator]
 static GLOBAL: Alloc = Alloc;
 
-const EVENT_BUCKET_LINES: usize = 65536; // event_id buckets: about this many lines each
+// event_id buckets: about this many lines each, so a bucket's dedup table
+// (2 slots of 8 bytes per line) fits a 1 MB L2
+#[cfg(not(feature = "bigdd"))]
+const EVENT_BUCKET_LINES: usize = 32768;
+#[cfg(feature = "bigdd")]
+const EVENT_BUCKET_LINES: usize = 65536;
 const PERSON_BUCKET_EVENTS: usize = 32768; // person buckets: few enough that staging groups stay in L2
 
 // ---------------------------------------------------------------- records
@@ -195,7 +200,16 @@ struct Persons {
     slots: Vec<KeySlot<Key>>,
     region_bits: u32, // each region holds 2^region_bits slots
     count: usize,
+    // One bit per hash value (about 8 bits per linked ID, so it stays in
+    // cache) set for every linked ID: a user whose bit is clear is not
+    // linked, and its lookup reads EMPTY_SLOT (always in L1) instead of a
+    // slot of the big table. The choice is a select, not a branch.
+    filter: Vec<u64>,
+    filter_mask: usize, // bits - 1
 }
+static EMPTY_SLOT: KeySlot<Key> = KeySlot { k: 0, v: 0 };
+// filter bits come from the hash above the bits that pick a slot in a region
+const FILTER_SHIFT: u32 = 24;
 
 #[inline(always)]
 fn part(h: u64) -> usize {
@@ -213,7 +227,39 @@ fn region_next(region_bits: u32, i: usize) -> usize {
 
 impl Persons {
     fn empty() -> Persons {
-        Persons { slots: vec![KeySlot { k: 0, v: 0 }; PARTS], region_bits: 0, count: 0 }
+        Persons {
+            slots: vec![KeySlot { k: 0, v: 0 }; PARTS],
+            region_bits: 0,
+            count: 0,
+            filter: vec![0; 1],
+            filter_mask: 63,
+        }
+    }
+    // The slot a lookup of user (h = key_hash(user)) should read: its first
+    // slot in the table if the filter has its bit, else EMPTY_SLOT.
+    #[inline(always)]
+    fn lookup_slot(&self, h: u64) -> *const KeySlot<Key> {
+        let i = (h >> FILTER_SHIFT) as usize & self.filter_mask;
+        let flagged = (unsafe { *self.filter.get_unchecked(i >> 6) } >> (i & 63)) & 1;
+        let real = unsafe { self.slots.as_ptr().add(region_slot(self.region_bits, h)) } as usize;
+        #[cfg(feature = "nofilter")]
+        return {
+            let _ = flagged;
+            real as *const KeySlot<Key>
+        };
+        let empty = &EMPTY_SLOT as *const KeySlot<Key> as usize;
+        (empty ^ ((real ^ empty) & (flagged as usize).wrapping_neg())) as *const KeySlot<Key>
+    }
+    // As name_select, reading the slot lookup_slot chose (only a real slot
+    // can hold another key, so EMPTY_SLOT never walks).
+    #[inline(always)]
+    fn name_at(&self, user: Key, h: u64, slot: *const KeySlot<Key>) -> (Key, bool) {
+        let s = unsafe { *slot };
+        if (s.k != user) & (s.k != 0) {
+            return self.name_hashed(user, h);
+        }
+        let linked = s.k == user;
+        (if linked { s.v } else { user }, linked)
     }
     // Linked or not is a coin toss from line to line: the first slot's answer
     // is selected, not branched on; only a collision walks on. Also says
@@ -298,7 +344,15 @@ fn build_persons(pairs: &mut Vec<Vec<(Key, Key)>>, threads: usize) -> Persons {
     while (1usize << region_bits) * 2 < most * 3 {
         region_bits += 1;
     }
-    let mut out = Persons { slots: vec![KeySlot { k: 0, v: 0 }; PARTS << region_bits], region_bits, count: 0 };
+    // filter: 8 bits per endpoint, at least 2^16, at most 2^30
+    let fbits = pow2_at_least(8 * 2 * n).clamp(1 << 16, 1 << 30);
+    let mut out = Persons {
+        slots: vec![KeySlot { k: 0, v: 0 }; PARTS << region_bits],
+        region_bits,
+        count: 0,
+        filter: vec![0; fbits / 64],
+        filter_mask: fbits - 1,
+    };
     let mut endpoint = vec![0u32; 2 * n];
     let mut sizes = vec![0u32; PARTS];
     {
@@ -405,6 +459,20 @@ fn build_persons(pairs: &mut Vec<Vec<(Key, Key)>>, threads: usize) -> Persons {
             }
         });
     }
+    {
+        // set each linked ID's filter bit (words shared between parts: atomic or)
+        use std::sync::atomic::AtomicU64;
+        let words = unsafe { std::slice::from_raw_parts(out.filter.as_ptr() as *const AtomicU64, out.filter.len()) };
+        let (slots, mask) = (&out.slots, out.filter_mask);
+        run_tasks(&mut workers, PARTS, |_, p| {
+            for s in &slots[p * region..(p + 1) * region] {
+                if s.k != 0 {
+                    let i = (key_hash(s.k) >> FILTER_SHIFT) as usize & mask;
+                    words[i >> 6].fetch_or(1 << (i & 63), Relaxed);
+                }
+            }
+        });
+    }
     for v in pairs.iter_mut() {
         *v = Vec::new();
     }
@@ -456,7 +524,10 @@ fn restart(var: &str, val: &str) -> ! {
 // Person lookups during the parse run this many lines after their prefetch,
 // so each (DRAM) miss overlaps the parsing of the lines between.
 const READ_PIECE: usize = 256 << 10;
+#[cfg(not(feature = "pd8"))]
 const PARSE_DELAY: usize = 12;
+#[cfg(feature = "pd8")]
+const PARSE_DELAY: usize = 8;
 
 // A long ID read at parse time, recorded (base.rs) when its line is flushed,
 // by then with its table slot prefetched. The bytes are still in the piece
@@ -484,6 +555,7 @@ struct PendingEvent<E: Ev> {
     ingest: i64,
     ev: E,
     h: u64, // key_hash(user)
+    slot: *const KeySlot<Key>, // Persons::lookup_slot(h), prefetched
     user_ref: LongRef,
     eid_check: u16,
 }
@@ -495,6 +567,7 @@ struct ParseState<E: Ev> {
     pending_ev: [PendingEvent<E>; PARSE_DELAY],
     pending_ck: [PersonClick<E>; PARSE_DELAY],
     pending_ck_h: [u64; PARSE_DELAY],
+    pending_ck_slot: [*const KeySlot<Key>; PARSE_DELAY],
     pending_ck_user: [LongRef; PARSE_DELAY],
     pending_ck_cid: [LongRef; PARSE_DELAY],
     nev: usize,
@@ -515,6 +588,7 @@ impl<E: Ev> ParseState<E> {
                 pending_ev: std::mem::zeroed(),
                 pending_ck: std::mem::zeroed(),
                 pending_ck_h: [0; PARSE_DELAY],
+                pending_ck_slot: [std::ptr::null(); PARSE_DELAY],
                 pending_ck_user: std::mem::zeroed(),
                 pending_ck_cid: std::mem::zeroed(),
                 nev: 0,
@@ -537,8 +611,26 @@ impl Ctx<'_> {
     #[inline(always)]
     fn flush_event<E: Ev>(&self, st: &mut ParseState<E>, i: usize) {
         let x = st.pending_ev[i];
-        let (person, linked) = self.persons.name_select(x.user, x.h);
+        let (person, linked) = self.persons.name_at(x.user, x.h, x.slot);
         // a linked ID's bytes were recorded with the links
+        #[cfg(feature = "probe")]
+        if probe::skip('e') || probe::skip('d') || probe::skip('r') {
+            if is_long(x.user) && !linked && !probe::skip('r') {
+                x.user_ref.record(x.user);
+            }
+            let p = if probe::skip('e') {
+                std::ptr::null_mut()
+            } else {
+                st.ev.push((key_hash(person) >> self.person_shift) as usize, PersonEvent { person, ev: x.ev })
+            };
+            if !probe::skip('d') {
+                st.dd.push(
+                    (key_hash(x.eid) >> self.event_shift) as usize,
+                    DedupRec { eid: x.eid, ev_check: p as u64 | (x.eid_check as u64) << 48, ingest: x.ingest },
+                );
+            }
+            return;
+        }
         if is_long(x.user) && !linked {
             x.user_ref.record(x.user);
         }
@@ -552,13 +644,17 @@ impl Ctx<'_> {
     fn flush_click<E: Ev>(&self, st: &mut ParseState<E>, i: usize) {
         let mut c = st.pending_ck[i];
         let (user, cid) = (c.person, c.cid);
-        let (person, linked) = self.persons.name_select(user, st.pending_ck_h[i]);
+        let (person, linked) = self.persons.name_at(user, st.pending_ck_h[i], st.pending_ck_slot[i]);
         c.person = person;
         if is_long(user) && !linked {
             st.pending_ck_user[i].record(user);
         }
         if is_long(cid) {
             st.pending_ck_cid[i].record(cid);
+        }
+        #[cfg(feature = "probe")]
+        if probe::skip('c') {
+            return;
         }
         st.ck.push((key_hash(person) >> self.person_shift) as usize, c);
     }
@@ -606,7 +702,8 @@ impl Ctx<'_> {
                         let mut check = 0u16;
                         let user = make_key_check(f[1].bytes(), &mut check);
                         let h = key_hash(user);
-                        self.persons.prefetch_hashed(h);
+                        let slot = self.persons.lookup_slot(h);
+                        prefetch(slot);
                         if is_long(user) {
                             prefetch_long(user);
                         }
@@ -620,6 +717,7 @@ impl Ctx<'_> {
                             ingest,
                             ev: E::event((ts - w.start) as u64, cat, price),
                             h,
+                            slot,
                             user_ref: LongRef::of(f[1], check),
                             eid_check,
                         };
@@ -630,6 +728,10 @@ impl Ctx<'_> {
             }
         }
         // an invalid copy files no event, but can still be the earliest copy
+        #[cfg(feature = "probe")]
+        if probe::skip('d') {
+            return;
+        }
         st.dd.push(
             (key_hash(eid) >> self.event_shift) as usize,
             DedupRec { eid, ev_check: (eid_check as u64) << 48, ingest },
@@ -650,7 +752,8 @@ impl Ctx<'_> {
         let user = make_key_check(f[1].bytes(), &mut ucheck);
         let cid = make_key_check(f[0].bytes(), &mut ccheck);
         let h = key_hash(user);
-        self.persons.prefetch_hashed(h);
+        let slot = self.persons.lookup_slot(h);
+        prefetch(slot);
         if is_long(user) {
             prefetch_long(user);
         }
@@ -664,9 +767,126 @@ impl Ctx<'_> {
         st.pending_ck[i] =
             PersonClick { person: user, cid, rel: E::rel((ts - self.w.click_start) as u64), camp };
         st.pending_ck_h[i] = h;
+        st.pending_ck_slot[i] = slot;
         st.pending_ck_user[i] = LongRef::of(f[1], ucheck);
         st.pending_ck_cid[i] = LongRef::of(f[0], ccheck);
         st.nck += 1;
+    }
+}
+
+// ---------------------------------------------------------------- probe
+
+// Analysis only (feature "probe"): the parse cut short at a layer, so the
+// time of each layer is the difference to the one before. Results are folded
+// into a black box so nothing is optimised away. Later stages see no input.
+#[cfg(feature = "probe")]
+mod probe {
+    use super::*;
+    pub const READ: u8 = 0; // read the bytes (pread pieces), nothing else
+    pub const SCAN: u8 = 1; // + split lines into fields
+    pub const FIELDS: u8 = 2; // + parse timestamps, type, price, campaign lookup
+    pub const KEYS: u8 = 3; // + build the ID keys and hash them
+    pub const RESOLVE: u8 = 4; // + each event's person, through the prefetch ring
+    pub const FULL: u8 = 5;
+    pub fn level() -> u8 {
+        static L: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *L.get_or_init(|| match std::env::var("SHOPPING_PROBE").as_deref() {
+            Ok("read") => READ,
+            Ok("scan") => SCAN,
+            Ok("fields") => FIELDS,
+            Ok("f-ingest") => 10,
+            Ok("f-ts") => 11,
+            Ok("f-rest") => 12,
+            Ok("keys") => KEYS,
+            Ok("resolve") => RESOLVE,
+            _ => FULL,
+        })
+    }
+    // SHOPPING_PROBE_SKIP letters skip parts of the full parse's filing:
+    // d = the event_id records, e = the person events, c = the clicks,
+    // r = recording long IDs. Output is wrong then; only the timing counts.
+    pub fn skip(c: char) -> bool {
+        static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        S.get_or_init(|| std::env::var("SHOPPING_PROBE_SKIP").unwrap_or_default()).contains(c)
+    }
+    pub fn run(ctx: &Ctx, is_event: bool, d: *const u8, len: usize, s: usize, e: usize) {
+        let lv = level();
+        let mut acc = 0u64;
+        let mut ring = [(0u64, 0u64); PARSE_DELAY];
+        let mut nr = 0usize;
+        if lv == READ {
+            // touch one byte per cache line, as the scanner's loads would
+            let mut i = s;
+            while i < e {
+                acc = acc.wrapping_add(unsafe { *d.add(i) } as u64);
+                i += 64;
+            }
+        } else if is_event {
+            for_lines::<7>(d, len, s, e, |f| {
+                acc = acc.wrapping_add(f[0].n as u64);
+                if lv < FIELDS {
+                    return;
+                }
+                if lv >= 10 {
+                    // one parser alone, on every line
+                    acc = acc.wrapping_add(match lv {
+                        10 => parse_f1(f[3]).unwrap_or(0) as u64,
+                        11 => parse_ts(f[2]).unwrap_or(0) as u64,
+                        _ => {
+                            let ty = unsafe { load64(f[4].p) };
+                            let price = parse_price(f[6]).unwrap_or(0);
+                            let cat = if price != 0 { ctx.catalog.category(f[5]) } else { 0 };
+                            ty ^ price as u64 ^ cat as u64
+                        }
+                    });
+                    return;
+                }
+                let Some(ingest) = parse_f1(f[3]) else { return };
+                let ts = parse_ts(f[2]).unwrap_or(0);
+                let ty = unsafe { load64(f[4].p) };
+                let price = parse_price(f[6]).unwrap_or(0);
+                let cat = if price != 0 { ctx.catalog.category(f[5]) } else { 0 };
+                acc = acc.wrapping_add(ingest as u64 ^ ts as u64 ^ ty ^ price as u64 ^ cat as u64);
+                if lv < KEYS {
+                    return;
+                }
+                let (mut c1, mut c2) = (0u16, 0u16);
+                let eid = make_key_check(f[0].bytes(), &mut c1);
+                let user = make_key_check(f[1].bytes(), &mut c2);
+                let h = key_hash(user);
+                acc = acc.wrapping_add(key_hash(eid) ^ h ^ c1 as u64 ^ c2 as u64);
+                if lv < RESOLVE {
+                    return;
+                }
+                ctx.persons.prefetch_hashed(h);
+                let i = nr % PARSE_DELAY;
+                if nr >= PARSE_DELAY {
+                    let (u, uh) = ring[i];
+                    let (person, linked) = ctx.persons.name_select(u, uh);
+                    acc = acc.wrapping_add(key_hash(person) ^ linked as u64);
+                }
+                ring[i] = (user, h);
+                nr += 1;
+            });
+        } else {
+            for_lines::<4>(d, len, s, e, |f| {
+                acc = acc.wrapping_add(f[0].n as u64);
+                if lv < FIELDS {
+                    return;
+                }
+                let camp = ctx.catalog.campaigns.find(make_key(f[2].bytes())).unwrap_or(0);
+                let ts = parse_ts(f[3]).unwrap_or(0);
+                acc = acc.wrapping_add(camp as u64 ^ ts as u64);
+                if lv < KEYS {
+                    return;
+                }
+                let (mut c1, mut c2) = (0u16, 0u16);
+                let cid = make_key_check(f[0].bytes(), &mut c1);
+                let user = make_key_check(f[1].bytes(), &mut c2);
+                acc = acc.wrapping_add(key_hash(cid) ^ key_hash(user) ^ c1 as u64 ^ c2 as u64);
+            });
+        }
+        std::hint::black_box(acc);
     }
 }
 
@@ -681,7 +901,11 @@ struct Pipeline {
 }
 
 struct DedupState {
+    // entries: tag (24 hash bits) << 40 | generation << 32 | record + 1. An
+    // entry of another generation (an earlier bucket) reads as empty, so the
+    // table is cleared only when its size changes or 255 buckets have used it.
     table: Vec<u64>,
+    generation: u64,
     blocks: Vec<*const DedupRec>,
     lens: Vec<u32>,
 }
@@ -861,6 +1085,11 @@ impl Pipeline {
                 let c = &chunks[i];
                 let is_event = i < event_chunks;
                 let parse_range = |st: &mut ParseState<E>, d: *const u8, len: usize, s: usize, e: usize| {
+                    #[cfg(feature = "probe")]
+                    if probe::level() != probe::FULL {
+                        probe::run(ctx, is_event, d, len, s, e);
+                        return;
+                    }
                     if is_event {
                         for_lines::<7>(d, len, s, e, |f| ctx.parse_event(f, st));
                     } else {
@@ -923,7 +1152,7 @@ impl Pipeline {
         // ---- dedup: per event_id bucket the earliest copy wins; every other
         // copy's filed event (if it has one) is dropped where it lies
         let mut dedup: Vec<DedupState> =
-            (0..threads).map(|_| DedupState { table: Vec::new(), blocks: Vec::new(), lens: Vec::new() }).collect();
+            (0..threads).map(|_| DedupState { table: Vec::new(), generation: 0, blocks: Vec::new(), lens: Vec::new() }).collect();
         run_tasks(&mut dedup, event_buckets, |st, b| {
             st.blocks.clear();
             st.lens.clear();
@@ -941,26 +1170,34 @@ impl Pipeline {
             }
             let cap = pow2_at_least(2 * n);
             let mask = cap - 1;
-            st.table.clear();
-            st.table.resize(cap, 0);
+            if st.table.len() != cap || st.generation == 255 {
+                st.table.clear();
+                st.table.resize(cap, 0);
+                st.generation = 1;
+            } else {
+                st.generation += 1;
+            }
+            const GEN: u64 = 0xFF << 32;
+            let generation = st.generation << 32;
             let blocks = &st.blocks;
-            let rec = |r: u64| -> &DedupRec { unsafe { &*blocks[(r >> 7) as usize].add((r & 127) as usize) } };
+            let rec = |r: u64| -> &DedupRec { unsafe { &*blocks.get_unchecked((r >> 7) as usize).add((r & 127) as usize) } };
             for (bi, &blk) in st.blocks.iter().enumerate() {
-                for i in 0..st.lens[bi] as usize {
+                for i in 0..unsafe { *st.lens.get_unchecked(bi) } as usize {
                     let r = unsafe { &*blk.add(i) };
                     let rref = ((bi as u64) << 7) | i as u64;
                     let eid = r.eid;
                     let h = key_hash(eid);
-                    let tag = h >> 32;
-                    let entry = (tag << 32) | (rref + 1);
+                    let tag = h >> 40;
+                    let entry = (tag << 40) | generation | (rref + 1);
                     let mut s = h as usize & mask;
+                    let table = st.table.as_mut_ptr(); // s is always masked into the table
                     loop {
-                        let cur = st.table[s];
-                        if cur == 0 {
-                            st.table[s] = entry;
+                        let cur = unsafe { *table.add(s) };
+                        if cur & GEN != generation {
+                            unsafe { *table.add(s) = entry };
                             break;
                         }
-                        if (cur >> 32) == tag {
+                        if (cur >> 40) == tag {
                             let o = rec((cur & 0xFFFFFFFF) - 1);
                             if o.eid == eid {
                                 if o.check() != r.check() {
@@ -969,7 +1206,7 @@ impl Pipeline {
                                 let (ri, oi) = (r.ingest, o.ingest);
                                 let drop = if ri < oi {
                                     // the new copy wins
-                                    st.table[s] = entry;
+                                    unsafe { *table.add(s) = entry };
                                     o.ev::<E>()
                                 } else {
                                     r.ev::<E>()
@@ -997,7 +1234,6 @@ impl Pipeline {
         order.sort_by(|a, b| b.0.cmp(&a.0));
         let kept: usize = parsed.iter().map(|d| (0..person_buckets).map(|p| d.ev.size(p)).sum::<usize>()).sum();
         let w = self.w;
-        let zero = E::pair(0, 0);
         let mut sess: Vec<SessionState<E>> = (0..threads)
             .map(|_| {
                 let mut work = PersonWork::new(w, ncamp, ncat);
@@ -1032,14 +1268,15 @@ impl Pipeline {
             if n == 0 {
                 return;
             }
-            st.local.reset(n / 48 + 16);
+            st.local.reset(n / 12 + 16); // about 20 events per person: room without regrowing
             st.names.clear();
             st.offsets.clear();
             st.offsets.push(0);
-            st.raw.clear();
-            st.raw.resize(n, zero);
-            st.lids.clear();
-            st.lids.resize(n, 0);
+            // Unchecked from here on: every index below is a count of what
+            // was just written (k < n events, lid < names, pos within its
+            // person's range), and the buffers are written before read.
+            resize_uninit(&mut st.raw, n);
+            resize_uninit(&mut st.lids, n);
             let mut k = 0;
             let mut max_hi = 0u64;
             for d in parsed {
@@ -1055,9 +1292,11 @@ impl Pipeline {
                         offsets.push(0);
                         (names.len() - 1) as u32
                     });
-                    st.offsets[lid as usize + 1] += 1;
-                    st.raw[k] = ev;
-                    st.lids[k] = lid;
+                    unsafe {
+                        *st.offsets.get_unchecked_mut(lid as usize + 1) += 1;
+                        *st.raw.get_unchecked_mut(k) = ev;
+                        *st.lids.get_unchecked_mut(k) = lid;
+                    }
                     k += 1;
                     max_hi = max_hi.max(ev.hi());
                 });
@@ -1074,35 +1313,44 @@ impl Pipeline {
             for i in 0..people {
                 st.offsets[i + 1] += st.offsets[i];
             }
-            st.evs.clear();
-            st.evs.resize(n, zero);
+            resize_uninit(&mut st.evs, n);
             st.pos.clear();
             st.pos.extend_from_slice(&st.offsets[..people]);
             for k in 0..n {
-                let l = st.lids[k] as usize;
-                st.evs[st.pos[l] as usize] = st.raw[k];
-                st.pos[l] += 1;
+                unsafe {
+                    let l = *st.lids.get_unchecked(k) as usize;
+                    let q = st.pos.get_unchecked_mut(l);
+                    *st.evs.get_unchecked_mut(*q as usize) = *st.raw.get_unchecked(k);
+                    *q += 1;
+                }
             }
 
-            // clicks of persons with events, likewise in time order
-            st.ck_raw.clear();
-            st.ck_lids.clear();
-            st.raw_cids.clear();
-            st.raw_camps.clear();
+            // clicks of persons with events, likewise in time order; the
+            // buffers are sized for every click of the bucket, then cut
+            let mc: usize = parsed.iter().map(|d| d.ck.size(p)).sum();
+            resize_uninit(&mut st.ck_raw, mc);
+            resize_uninit(&mut st.ck_lids, mc);
+            resize_uninit(&mut st.raw_cids, mc);
+            resize_uninit(&mut st.raw_camps, mc);
+            let mut m = 0usize;
             let mut max_hi = 0u64;
             for d in parsed {
                 d.ck.for_each(p, |c| {
                     let Some(lid) = st.local.find(c.person) else { return };
                     let rel = E::rel_value(c.rel);
-                    st.ck_raw.push(E::pair(rel, st.ck_raw.len() as u64));
-                    st.ck_lids.push(lid);
-                    st.raw_cids.push(c.cid);
-                    st.raw_camps.push(c.camp);
+                    unsafe {
+                        *st.ck_raw.get_unchecked_mut(m) = E::pair(rel, m as u64);
+                        *st.ck_lids.get_unchecked_mut(m) = lid;
+                        *st.raw_cids.get_unchecked_mut(m) = c.cid;
+                        *st.raw_camps.get_unchecked_mut(m) = c.camp;
+                    }
+                    m += 1;
                     max_hi = max_hi.max(rel);
                 });
             }
+            st.ck_raw.truncate(m);
+            st.ck_lids.truncate(m);
             radix_by_time(&mut st.ck_raw, &mut st.ck_lids, &mut st.tmp, &mut st.tmp_lids, max_hi, &mut st.hist);
-            let m = st.ck_raw.len();
             st.ck_offsets.clear();
             st.ck_offsets.resize(people + 1, 0);
             for &l in &st.ck_lids {
@@ -1111,22 +1359,23 @@ impl Pipeline {
             for i in 0..people {
                 st.ck_offsets[i + 1] += st.ck_offsets[i];
             }
-            st.cks.clear();
-            st.cks.resize(m, zero);
-            st.cids.clear();
-            st.cids.resize(m, 0);
-            st.camps.clear();
-            st.camps.resize(m, 0);
+            resize_uninit(&mut st.cks, m);
+            resize_uninit(&mut st.cids, m);
+            resize_uninit(&mut st.camps, m);
             st.pos.clear();
             st.pos.extend_from_slice(&st.ck_offsets[..people]);
             for k in 0..m {
-                let l = st.ck_lids[k] as usize;
-                let q = st.pos[l] as usize;
-                st.pos[l] += 1;
-                let idx = st.ck_raw[k].lo() as usize;
-                st.cks[q] = E::pair(st.ck_raw[k].hi(), q as u64);
-                st.cids[q] = st.raw_cids[idx];
-                st.camps[q] = st.raw_camps[idx];
+                unsafe {
+                    let l = *st.ck_lids.get_unchecked(k) as usize;
+                    let slot = st.pos.get_unchecked_mut(l);
+                    let q = *slot as usize;
+                    *slot += 1;
+                    let x = *st.ck_raw.get_unchecked(k);
+                    let idx = x.lo() as usize;
+                    *st.cks.get_unchecked_mut(q) = E::pair(x.hi(), q as u64);
+                    *st.cids.get_unchecked_mut(q) = *st.raw_cids.get_unchecked(idx);
+                    *st.camps.get_unchecked_mut(q) = *st.raw_camps.get_unchecked(idx);
+                }
             }
             for l in 0..people {
                 let (e0, e1) = (st.offsets[l] as usize, st.offsets[l + 1] as usize);

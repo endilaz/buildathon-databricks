@@ -202,9 +202,11 @@ pub struct CampaignCells {
     pub cells: Vec<[u64; 4]>,
 }
 impl CampaignCells {
+    // campaign <= the campaign count (organic last) and day < days, always:
+    // campaigns come from the catalog and days from the window
     #[inline(always)]
     pub fn at(&mut self, campaign: u32, day: u32) -> &mut [u64; 4] {
-        &mut self.cells[campaign as usize * self.days as usize + day as usize]
+        unsafe { self.cells.get_unchecked_mut(campaign as usize * self.days as usize + day as usize) }
     }
 }
 
@@ -274,15 +276,19 @@ impl<E: Ev> PersonWork<E> {
         let m = ck.len();
         self.sessions.clear();
         let offset = (w.start - w.click_start) as u64;
+        // Unchecked indexing below: i < n, j < m, and positions and campaigns
+        // come from the bucket that built ev, ck, cid and camp.
+        let at = |a: &[E], i: usize| unsafe { *a.get_unchecked(i) };
         let mut i = 0;
         while i < n {
             let lo = i;
-            let first = ev[i].hi();
+            let first = at(ev, i).hi();
             let mut prev = first;
             let mut revenue = 0u64;
-            while i < n && ev[i].hi() - prev <= GAP as u64 {
-                prev = ev[i].hi();
-                revenue += ev[i].price() as u64;
+            while i < n && at(ev, i).hi() - prev <= GAP as u64 {
+                let e = at(ev, i);
+                prev = e.hi();
+                revenue += e.price() as u64;
                 i += 1;
             }
             let start = w.start + first as i64;
@@ -318,11 +324,12 @@ impl<E: Ev> PersonWork<E> {
                     if price == 0 {
                         continue;
                     }
-                    let c = e.cat() as usize;
-                    if self.spend[c] == 0 {
+                    let c = e.cat() as usize; // < categories: from the catalog
+                    let spend = unsafe { self.spend.get_unchecked_mut(c) };
+                    if *spend == 0 {
                         self.touched.push(c as u32);
                     }
-                    self.spend[c] += price as u64;
+                    *spend += price as u64;
                 }
             }
             if !self.touched.is_empty() {
@@ -354,38 +361,39 @@ impl<E: Ev> PersonWork<E> {
         let mut chosen = self.organic;
         for si in 0..ns {
             let s = self.sessions[si];
-            while j < m && ck[j].hi() <= s.start {
-                if j == 0 || ck[j].hi() != ck[j - 1].hi() {
+            while j < m && at(ck, j).hi() <= s.start {
+                if j == 0 || at(ck, j).hi() != at(ck, j - 1).hi() {
                     run = j;
                 }
                 j += 1;
             }
             let mut campaign = self.organic;
-            if j > 0 && s.start - ck[j - 1].hi() <= WEEK as u64 {
+            if j > 0 && s.start - at(ck, j - 1).hi() <= WEEK as u64 {
                 if chosen_run != run {
                     // the latest timestamp; among equal ones the smallest click_id
-                    let mut best = ck[run].lo() as usize;
+                    let mut best = at(ck, run).lo() as usize;
                     for q in run + 1..j {
-                        let pos = ck[q].lo() as usize;
+                        let pos = at(ck, q).lo() as usize;
                         if key_less(cid[pos], cid[best]) {
                             best = pos;
                         }
                     }
                     chosen_run = run;
-                    chosen = camp[best];
+                    chosen = unsafe { *camp.get_unchecked(best) };
                 }
                 campaign = chosen;
             }
             Self::credit(&mut self.cells, campaign, &s);
             if direct {
-                while lo < j && ck[lo].hi() + (WEEK as u64) < s.start {
+                while lo < j && at(ck, lo).hi() + (WEEK as u64) < s.start {
                     lo += 1;
                 }
                 self.stamp_id += 1;
                 for q in lo..j {
-                    let c = camp[ck[q].lo() as usize];
-                    if self.stamp[c as usize] != self.stamp_id {
-                        self.stamp[c as usize] = self.stamp_id;
+                    let c = unsafe { *camp.get_unchecked(at(ck, q).lo() as usize) };
+                    let stamp = unsafe { self.stamp.get_unchecked_mut(c as usize) };
+                    if *stamp != self.stamp_id {
+                        *stamp = self.stamp_id;
                         self.cells.at(c, s.day)[3] += 1;
                     }
                 }

@@ -20,3 +20,10 @@ strip = true
 
 [features]
 collide = []  # tests: few long-ID key bits, so long IDs collide
+probe = []    # analysis: SHOPPING_PROBE=read|scan|fields|keys stops the parse early
+# x86 bench variants, each an earlier choice: 64-byte scanner blocks, an
+# 8-line parse delay, 64k-line dedup buckets, no linked-ID filter
+scan64 = []
+pd8 = []
+bigdd = []
+nofilter = []

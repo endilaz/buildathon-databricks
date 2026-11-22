@@ -102,8 +102,11 @@ pub struct Field {
     pub p: *const u8,
     pub n: usize,
 }
+// Padding an empty field can point at (fixed-width loads read up to 64 bytes).
+static EMPTY_PAD: [u8; 64] = [0; 64];
+
 impl Field {
-    pub const EMPTY: Field = Field { p: std::ptr::null(), n: 0 };
+    pub const EMPTY: Field = Field { p: EMPTY_PAD.as_ptr(), n: 0 };
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.n
@@ -112,13 +115,11 @@ impl Field {
     pub fn is_empty(&self) -> bool {
         self.n == 0
     }
+    // p is never null: the scanner's fields point into their line, and
+    // EMPTY into EMPTY_PAD, so no branch is needed for n == 0.
     #[inline(always)]
     pub fn bytes(&self) -> &[u8] {
-        if self.n == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(self.p, self.n) }
-        }
+        unsafe { std::slice::from_raw_parts(self.p, self.n) }
     }
     // Byte i, which may be past the end (padding).
     #[inline(always)]
@@ -490,6 +491,17 @@ pub fn mix64(mut x: u64) -> u64 {
 #[inline(always)]
 pub fn key_hash(k: Key) -> u64 {
     mix64(k.wrapping_mul(0x9E3779B97F4A7C15))
+}
+
+// ---------------------------------------------------------------- vectors
+
+// Sets v's length to n without initialising new elements: for plain-integer
+// buffers that are fully written before they are read.
+#[inline(always)]
+pub fn resize_uninit<T: Copy>(v: &mut Vec<T>, n: usize) {
+    v.clear();
+    v.reserve(n);
+    unsafe { v.set_len(n) };
 }
 
 // ---------------------------------------------------------------- threads
